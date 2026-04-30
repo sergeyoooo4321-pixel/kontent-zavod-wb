@@ -439,11 +439,28 @@ async def process_product_images_hybrid(
 
         units_map: dict[str, int] = {"main": 1, "pack2": 2, "pack3": 3, "extra": 1}
         for mode, bg_bytes in bgs.items():
+            base_card: bytes | None = None
+            final: bytes | None = None
             try:
                 base_card = composite_card(bg_bytes, product_png, units=units_map[mode])
+            except Exception as e:
+                state.errors.append(f"composite {mode}: {e}")
+                logger.exception("composite %s/%s: %s", state.sku, mode, e)
+                continue
+
+            try:
                 plashki_ctx = _build_plashki_context(brief, mode)
                 plashki_png = await render_html_to_png("card_plashki.html.j2", plashki_ctx)
                 final = await overlay_plashki(base_card, plashki_png)
+            except Exception as e:
+                # Плашки не отрендерились (chromium deps, шаблон, etc) — публикуем
+                # карточку без плашек (фон + товар) чтобы хоть что-то отдать юзеру.
+                state.warnings.append(f"plashki {mode}: {e}")
+                logger.warning("plashki render %s/%s failed, fallback to bare card: %s",
+                               state.sku, mode, e)
+                final = base_card
+
+            try:
                 public = await deps.s3.put_public(
                     S3Client.build_key(batch_id, state.sku, mode),
                     final,
@@ -451,8 +468,8 @@ async def process_product_images_hybrid(
                 )
                 state.images[mode] = public
             except Exception as e:
-                state.errors.append(f"compose {mode}: {e}")
-                logger.exception("compose %s/%s: %s", state.sku, mode, e)
+                state.errors.append(f"upload {mode}: {e}")
+                logger.exception("upload %s/%s: %s", state.sku, mode, e)
 
         # 6. Отдаём пользователю: альбом + ссылки + ZIP
         try:
