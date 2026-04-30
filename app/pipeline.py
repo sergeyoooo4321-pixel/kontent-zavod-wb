@@ -67,12 +67,15 @@ async def process_product_images(
     deps: Deps,
     sem: asyncio.Semaphore,
 ) -> None:
-    """Sequential within product: src → main → (pack2|pack3|extra parallel with ref=main).
+    """Non-cascading parallel pipeline:
+        src → identity+design (1 vision LLM call) → ВСЕ 4 параллельно с ref=src
 
-    Pack/extra используют main как input_urls — копируют дизайн один-в-один.
+    КРИТИЧНО: ни одна генерация не использует другую сгенерированную картинку
+    как reference. Только оригинал юзера. Identity-Lock в каждом промпте
+    защищает упаковку от изменений.
     """
     async with sem:
-        # 1. скачать из TG → S3 (src)
+        # 1. скачать из TG → S3 (src) — это якорь идентичности на ВСЕ генерации
         try:
             raw = await deps.tg.get_file_bytes(state.tg_file_id)
             src_key = S3Client.build_key(batch_id, state.sku, "src")
@@ -85,67 +88,55 @@ async def process_product_images(
             return
 
         try:
-            await deps.tg.send(chat_id, f"📥 `{state.sku}`: фото в S3 → дизайн-режиссёр анализирует…", parse_mode="Markdown")
+            await deps.tg.send(
+                chat_id,
+                f"📥 `{state.sku}`: фото в S3 → анализирую идентичность товара…",
+                parse_mode="Markdown",
+            )
         except Exception:
             pass
 
-        # 2. LLM-арт-директор смотрит на фото и сочиняет JSON-бриф дизайна
-        design_brief: dict = {}
+        # 2. ОДИН vision-вызов: identity + design в одном JSON
+        brief: dict = {}
         try:
-            design_brief = await deps.kie.chat_json_with_vision(
+            brief = await deps.kie.chat_json_with_vision(
                 system=build_design_director_system(),
                 user=build_design_director_user(state.name, state.brand),
                 image_url=state.src_url,
             )
-            logger.info("design_brief %s: scene=%s", state.sku,
-                        (design_brief.get("scene") or "")[:80])
+            identity = brief.get("identity") or {}
+            design = brief.get("design") or {}
+            logger.info(
+                "brief %s: shape=%s, scene=%s",
+                state.sku,
+                (identity.get("shape") or "")[:60],
+                (design.get("scene") or "")[:60],
+            )
             try:
-                vibe = design_brief.get("overall_vibe") or design_brief.get("scene") or ""
+                vibe = (design.get("overall_vibe") or design.get("scene") or "")[:200]
+                shape = (identity.get("shape") or "")[:120]
                 await deps.tg.send(
                     chat_id,
-                    f"🎨 `{state.sku}`: дизайн придуман — {vibe[:200]}\nГенерю main…",
+                    f"🎨 `{state.sku}`:\n"
+                    f"• identity: {shape}\n"
+                    f"• design: {vibe}\n"
+                    f"Генерю 4 фото параллельно от оригинала…",
                     parse_mode="Markdown",
                 )
             except Exception:
                 pass
         except Exception as e:
-            logger.warning("design_brief %s failed, fallback to generic: %s", state.sku, e)
-            design_brief = {}  # fallback на универсальный промпт
+            logger.warning("brief %s failed, fallback to generic: %s", state.sku, e)
+            brief = {}  # fallback
 
-        # 3. MAIN — генерим по брифу + ref=src (товар сохраняется точно)
-        try:
-            main_prompt = (
-                compile_image_prompt(design_brief, state.name, mode="main")
-                if design_brief else build_main_prompt(state.name, state.brand)
-            )
-            main_kie_url = await deps.kie.generate_image(
-                prompt=main_prompt,
-                input_urls=[state.src_url],
-            )
-            main_bytes = await deps.s3.fetch(main_kie_url)
-            state.images["main"] = await deps.s3.put_public(
-                S3Client.build_key(batch_id, state.sku, "main"), main_bytes
-            )
-            try:
-                await deps.tg.send(
-                    chat_id,
-                    f"🎨 `{state.sku}`: main готов, генерю набор 2/3 + доп…",
-                    parse_mode="Markdown",
-                )
-            except Exception:
-                pass
-        except (KieAIError, KieAITimeout, S3Error) as e:
-            state.errors.append(f"main: {e}")
-            logger.exception("main %s: %s", state.sku, e)
-            # без main pack/extra бессмысленны — выходим
-            return
-
-        # 3. pack2/pack3/extra ПАРАЛЛЕЛЬНО, все используют main_url как ref
-        ref_url = state.images["main"]
-
+        # 3. ВСЕ 4 генерации параллельно, ВСЕ используют ОРИГИНАЛ как ref.
+        # Никакой каскадной зависимости main → pack/extra.
         async def _gen(tag: str, prompt: str) -> tuple[str, str | None, str | None]:
             try:
-                kie_url = await deps.kie.generate_image(prompt=prompt, input_urls=[ref_url])
+                kie_url = await deps.kie.generate_image(
+                    prompt=prompt,
+                    input_urls=[state.src_url],  # ВСЕГДА оригинал
+                )
                 content = await deps.s3.fetch(kie_url)
                 public = await deps.s3.put_public(
                     S3Client.build_key(batch_id, state.sku, tag), content
@@ -157,25 +148,29 @@ async def process_product_images(
                 logger.exception("unexpected %s/%s: %s", state.sku, tag, e)
                 return tag, None, f"unexpected: {e}"
 
-        # промпты для pack/extra: используем тот же design_brief если он есть
+        main_prompt = (
+            compile_image_prompt(brief, state.name, mode="main")
+            if brief else build_main_prompt(state.name, state.brand)
+        )
         pack2_prompt = (
-            compile_image_prompt(design_brief, state.name, mode="pack2", qty=2)
-            if design_brief else build_pack_prompt(state.name, 2)
+            compile_image_prompt(brief, state.name, mode="pack2", qty=2)
+            if brief else build_pack_prompt(state.name, 2)
         )
         pack3_prompt = (
-            compile_image_prompt(design_brief, state.name, mode="pack3", qty=3)
-            if design_brief else build_pack_prompt(state.name, 3)
+            compile_image_prompt(brief, state.name, mode="pack3", qty=3)
+            if brief else build_pack_prompt(state.name, 3)
         )
         extra_prompt = (
-            compile_image_prompt(design_brief, state.name, mode="extra")
-            if design_brief else build_extra_prompt(state.name)
+            compile_image_prompt(brief, state.name, mode="extra")
+            if brief else build_extra_prompt(state.name)
         )
-        triple = await asyncio.gather(
+        results = await asyncio.gather(
+            _gen("main", main_prompt),
             _gen("pack2", pack2_prompt),
             _gen("pack3", pack3_prompt),
             _gen("extra", extra_prompt),
         )
-        for tag, url, err in triple:
+        for tag, url, err in results:
             if url:
                 state.images[tag] = url
             else:
