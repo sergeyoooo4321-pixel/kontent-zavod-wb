@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, status
 
+from fastapi import Request
+
 from .config import settings
 from .kie_ai import KieAIClient
 from .models import RunRequest, RunResponse
@@ -15,6 +17,7 @@ from .ozon import OzonClient
 from .pipeline import Deps, run_batch
 from .s3 import S3Client
 from .telegram import TelegramClient
+from .tg_handler import handle_update
 from .wb import WBClient
 
 logging.basicConfig(
@@ -91,6 +94,23 @@ async def healthz():
         "wb_creds": settings.has_wb_creds,
         "ts": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@app.post("/tg/webhook", status_code=200)
+async def tg_webhook(request: Request, bg: BackgroundTasks):
+    """Прямой Telegram webhook handler. Заменяет n8n-приёмку.
+
+    Telegram POSTит сюда update — мы парсим, обновляем session-state,
+    отвечаем юзеру, при confirm запускаем pipeline в фоне.
+    """
+    try:
+        update = await request.json()
+    except Exception as e:
+        logger.warning("tg/webhook bad json: %s", e)
+        return {"ok": True}
+    deps: Deps = app.state.deps
+    bg.add_task(handle_update, update, deps)
+    return {"ok": True}
 
 
 @app.post("/api/run", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED)

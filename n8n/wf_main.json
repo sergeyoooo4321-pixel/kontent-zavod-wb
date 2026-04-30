@@ -6,26 +6,19 @@
     "nodes": [
       {
         "parameters": {
-          "updates": [
-            "message"
-          ],
-          "additionalFields": {}
+          "httpMethod": "POST",
+          "path": "cz-tg-input",
+          "responseMode": "onReceived",
+          "options": {}
         },
         "id": "wfm-0-1",
         "name": "TG Webhook",
-        "type": "n8n-nodes-base.telegramTrigger",
-        "typeVersion": 1.2,
+        "type": "n8n-nodes-base.webhook",
+        "typeVersion": 2,
         "position": [
           -1280,
           0
-        ],
-        "webhookId": "a2c5ed0d-8e01-407e-b8c1-485ad3851ce2",
-        "credentials": {
-          "telegramApi": {
-            "id": "TELEGRAM_BOT",
-            "name": "Telegram Bot (Контент завод)"
-          }
-        }
+        ]
       },
       {
         "parameters": {
