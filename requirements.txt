@@ -12,9 +12,11 @@ aiofiles>=24.1
 python-multipart>=0.0.9
 # ── Hybrid pipeline (refactor_plan.md §4) ─────────────
 # rembg: U2Net фон-ремовер локально (~170MB модели при первом запуске)
+#   ВАЖНО: ставим именно [cpu] extra — иначе onnxruntime не подтянется и
+#   `from rembg import remove` упадёт на SystemExit ещё на импорте.
 # playwright: headless chromium для рендера плашек из HTML/CSS
 # jinja2: шаблонизатор плашек
-rembg>=2.0.59
+rembg[cpu]>=2.0.59
 playwright>=1.47
 jinja2>=3.1
 pytest>=8.3

@@ -30,7 +30,16 @@ def remove_bg(src_bytes: bytes) -> bytes:
 
     Возвращает PNG-байты с прозрачным фоном (товар вырезан и обрезан по bbox).
     """
-    from rembg import remove  # type: ignore[import-not-found]
+    # rembg.bg делает sys.exit(1) если onnxruntime не установлен — это валит
+    # весь uvicorn-процесс через SystemExit (он не Exception, а BaseException).
+    # Ловим явно и поднимаем RuntimeError, чтобы pipeline-handler смог его обработать.
+    try:
+        from rembg import remove  # type: ignore[import-not-found]
+    except SystemExit as e:
+        raise RuntimeError(
+            "rembg недоступен (onnxruntime отсутствует). "
+            "Установи 'rembg[cpu]' в requirements.txt и переустанови."
+        ) from e
 
     src_img = Image.open(io.BytesIO(src_bytes)).convert("RGBA")
     cut = remove(src_img, session=_get_session(), post_process_mask=True)
