@@ -137,21 +137,37 @@ class OzonTemplate:
 
         return result
 
-    @staticmethod
-    def _extract_list_values(formula: str) -> list[str]:
+    def _extract_list_values(self, formula: str) -> list[str]:
         """Извлекает значения из формулы Data Validation.
 
-        Поддерживает:
+        V5 — теперь поддерживает:
         - Inline: `"a,b,c"` → ['a','b','c']
-        - Reference: `Sheet!$A$1:$A$10` — игнор, т.к. читаем отдельным листом.
+        - Reference: `=Sheet!$A$1:$A$100` — читает диапазон с указанного листа
         """
-        f = formula.strip()
+        f = (formula or "").strip().lstrip("=")
         if f.startswith('"') and f.endswith('"'):
             inner = f[1:-1]
             return [s.strip() for s in inner.split(",") if s.strip()]
-        if f.startswith("=") and (f[1] == '"' if len(f) > 1 else False):
-            inner = f[2:-1]
-            return [s.strip() for s in inner.split(",") if s.strip()]
+        if "!" in f:
+            sheet_part, rng = f.split("!", 1)
+            sheet_name = sheet_part.strip("'\"")
+            if sheet_name in self._wb.sheetnames:
+                try:
+                    ws = self._wb[sheet_name]
+                    out: list[str] = []
+                    for row in ws[rng]:
+                        for c in row:
+                            if c.value is None:
+                                continue
+                            s = str(c.value).strip()
+                            if s and s not in out:
+                                out.append(s)
+                    return out
+                except Exception as e:
+                    logger.warning("DV reference parse %s: %s", f, e)
+                    return []
+            else:
+                logger.warning("DV references missing sheet %s", sheet_name)
         return []
 
     # ─── заполнение ───────────────────────────────────────

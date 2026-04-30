@@ -11,10 +11,13 @@ from pydantic import BaseModel, Field
 
 class ProductIn(BaseModel):
     idx: int
-    sku: str
-    name: str
-    tg_file_id: str
+    sku: str = Field(min_length=1, max_length=64)
+    name: str = Field(min_length=1, max_length=500)
+    tg_file_id: str = Field(min_length=10, max_length=200)  # реальный TG file_id всегда длинный
     brand: str | None = None
+    # опциональные данные товара (если есть — используются; иначе LLM-fallback или дефолты)
+    weight_g: int | None = Field(default=None, ge=1, le=1_000_000)
+    dims: dict[str, float] | None = None  # {"l":..,"w":..,"h":..}
 
 
 class RunRequest(BaseModel):

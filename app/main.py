@@ -64,6 +64,8 @@ async def lifespan(app: FastAPI):
     )
     wb = WBClient(base=settings.WB_BASE, token=settings.WB_TOKEN, http=http)
 
+    await s3.start()  # долгоживущий aiobotocore-клиент
+
     app.state.deps = Deps(tg=tg, kie=kie, s3=s3, ozon=ozon, wb=wb)
     app.state.http = http
     logger.info("cz-backend started: kie=%s s3=%s ozon=%s wb=%s",

@@ -61,42 +61,32 @@ async def process_product_images(
     deps: Deps,
     sem: asyncio.Semaphore,
 ) -> None:
+    """C5/C6 фикс: узкие except, не теряем sgenerированные картинки, fallback цепочки."""
     async with sem:
+        # 1. скачать из TG → S3
         try:
-            # 1. скачать из TG
             raw = await deps.tg.get_file_bytes(state.tg_file_id)
-            # 2. в S3 как _src.jpg
             src_key = S3Client.build_key(batch_id, state.sku, "src")
             state.src_url = await deps.s3.put_public(src_key, raw, "image/jpeg")
-            await deps.tg.send(chat_id, f"📥 `{state.sku}`: исходное фото в S3", parse_mode="Markdown")
-        except (S3Error, Exception) as e:
-            err = f"src upload: {e}"
-            state.errors.append(err)
-            logger.exception("process_product_images.src %s: %s", state.sku, e)
-            return  # без исходного фото нет смысла генерить
+        except Exception as e:
+            state.errors.append(f"src: {e}")
+            logger.exception("src upload %s: %s", state.sku, e)
+            return  # без исходного фото нет смысла продолжать
 
-        # 3. main: image-to-image с ref=src
+        # отдельный try чтобы tg.send-ошибка не валила pipeline
         try:
-            main_kie_url = await deps.kie.generate_image(
-                prompt=build_main_prompt(state.name, state.brand),
-                input_urls=[state.src_url],
-            )
-            main_bytes = await deps.s3.fetch(main_kie_url)
-            main_url = await deps.s3.put_public(
-                S3Client.build_key(batch_id, state.sku, "main"), main_bytes
-            )
-            state.images["main"] = main_url
-        except (KieAIError, KieAITimeout, S3Error) as e:
-            state.errors.append(f"main: {e}")
-            logger.exception("main gen failed %s: %s", state.sku, e)
+            await deps.tg.send(chat_id, f"📥 `{state.sku}`: фото в S3", parse_mode="Markdown")
+        except Exception as e:
+            logger.warning("tg.send src-status %s: %s", state.sku, e)
 
-        # 4. pack2/pack3/extra параллельно с ref=main (или src если main упал)
-        ref_url = state.images.get("main") or state.src_url
-        async def _gen(tag: str, prompt: str) -> tuple[str, str | None, str | None]:
+        # 2. main + pack/extra ПАРАЛЛЕЛЬНО с ref=src_url (V3)
+        # main всё равно используется как ref для pack-ов в улучшенной версии,
+        # но для упрощения и скорости — все 4 берут src как референс.
+        async def _gen_one(tag: str, prompt: str) -> tuple[str, str | None, str | None]:
             try:
                 kie_url = await deps.kie.generate_image(
                     prompt=prompt,
-                    input_urls=[ref_url] if ref_url else None,
+                    input_urls=[state.src_url],
                 )
                 content = await deps.s3.fetch(kie_url)
                 public = await deps.s3.put_public(
@@ -105,24 +95,32 @@ async def process_product_images(
                 return tag, public, None
             except (KieAIError, KieAITimeout, S3Error) as e:
                 return tag, None, str(e)
+            except Exception as e:
+                logger.exception("unexpected error in _gen_one %s/%s: %s", state.sku, tag, e)
+                return tag, None, f"unexpected: {e}"
 
-        triple = await asyncio.gather(
-            _gen("pack2", build_pack_prompt(state.name, 2)),
-            _gen("pack3", build_pack_prompt(state.name, 3)),
-            _gen("extra", build_extra_prompt(state.name)),
+        results = await asyncio.gather(
+            _gen_one("main", build_main_prompt(state.name, state.brand)),
+            _gen_one("pack2", build_pack_prompt(state.name, 2)),
+            _gen_one("pack3", build_pack_prompt(state.name, 3)),
+            _gen_one("extra", build_extra_prompt(state.name)),
+            return_exceptions=False,
         )
-        for tag, url, err in triple:
+        for tag, url, err in results:
             if url:
                 state.images[tag] = url
             else:
                 state.errors.append(f"{tag}: {err}")
 
         ok = len(state.images)
-        await deps.tg.send(
-            chat_id,
-            f"🖼 `{state.sku}`: {ok}/4 фото готовы",
-            parse_mode="Markdown",
-        )
+        try:
+            await deps.tg.send(
+                chat_id,
+                f"🖼 `{state.sku}`: {ok}/4 фото готовы",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            logger.warning("tg.send images-status %s: %s", state.sku, e)
 
 
 # ─── Этап 2: категории ───────────────────────────────────────────
@@ -208,15 +206,20 @@ async def load_category_data(
     ozon_vals: dict[int, list[dict]] = {}
     if settings.has_ozon_creds and ozon_type_id:
         ozon_attrs = await deps.ozon.category_attributes(ozon_id, ozon_type_id)
-        # Подгружаем значения только для атрибутов с dictionary_id != 0
-        for a in ozon_attrs:
-            if a.get("dictionary_id"):
-                try:
-                    ozon_vals[a["id"]] = await deps.ozon.attribute_values(
-                        a["id"], ozon_id, ozon_type_id
-                    )
-                except OzonError as e:
-                    logger.warning("attribute_values %s err: %s", a["id"], e)
+        # V8 — параллельная подгрузка значений для всех атрибутов с dictionary_id
+        attrs_with_dict = [a for a in ozon_attrs if a.get("dictionary_id")]
+
+        async def _values(a):
+            try:
+                vals = await deps.ozon.attribute_values(a["id"], ozon_id, ozon_type_id)
+                return a["id"], vals
+            except OzonError as e:
+                logger.warning("attribute_values %s err: %s", a["id"], e)
+                return a["id"], []
+
+        if attrs_with_dict:
+            for aid, vals in await asyncio.gather(*[_values(a) for a in attrs_with_dict]):
+                ozon_vals[aid] = vals
 
     wb_charcs = []
     wb_vals: dict[int, list[dict]] = {}
@@ -246,9 +249,13 @@ async def build_skus_and_texts(
         state.errors.append("titles: no category")
         return
 
-    # 1. расширение до 3 SKU
+    # 1. расширение до 3 SKU (C7 — реальные размеры/вес если переданы юзером)
+    # Если weight/dims не заданы — LLM-fallback по названию (TODO), пока дефолт.
+    weight = getattr(state, "_weight_g", 100) or 100  # 100г по умолчанию
+    dims = getattr(state, "_dims", None) or {"l": 15, "w": 10, "h": 5}  # дефолт ~среднее
     state.skus_3 = expand_to_3_skus(
-        {"sku": state.sku, "name": state.name, "weight": 0, "dims": {"l": 10, "w": 10, "h": 10}}
+        {"sku": state.sku, "name": state.name, "weight": weight, "dims": dims},
+        dims_from_internet=True,  # +1 см подстраховка
     )
 
     # 2. LLM тексты по каждой qty
@@ -284,8 +291,9 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
     main = images.get("main") or state.src_url
     extra = images.get("extra")
     pack_url = images.get(f"pack{sku_row['qty']}") if sku_row["qty"] in (2, 3) else None
-    image_urls = [u for u in (pack_url or main, extra) if u]
-
+    # C6 — fallback цепочка: pack → main → src
+    hero = pack_url or main or state.src_url
+    image_urls = [u for u in (hero, extra) if u]
     # минимальный набор атрибутов; реальные id зависят от категории
     attributes: list[dict] = []
     return {
@@ -361,7 +369,9 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
     main = images.get("main") or state.src_url
     extra = images.get("extra")
     pack_url = images.get(f"pack{sku_row['qty']}") if sku_row["qty"] in (2, 3) else None
-    media = [u for u in (pack_url or main, extra) if u]
+    # C6 fallback
+    hero = pack_url or main or state.src_url
+    media = [u for u in (hero, extra) if u]
     return {
         "subjectID": state.wb_subject.id if state.wb_subject else 0,
         "vendorCode": sku_row["sku"],
@@ -466,10 +476,19 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
         # Этап 4: тексты + расширение SKU
         await asyncio.gather(*[build_skus_and_texts(s, cat_data, deps) for s in states])
 
-        # Этап 5: заливка
-        ozon_rep, wb_rep = await asyncio.gather(
+        # Этап 5: заливка (V7 — return_exceptions, чтобы одна сторона не валила другую)
+        results = await asyncio.gather(
             upload_ozon(states, cat_data, deps),
             upload_wb(states, cat_data, deps),
+            return_exceptions=True,
+        )
+        ozon_rep = results[0] if isinstance(results[0], Report) else Report(
+            batch_id=req.batch_id, total=0,
+            errors=[ReportItem(sku="*", mp="ozon", reason=str(results[0])[:200])],
+        )
+        wb_rep = results[1] if isinstance(results[1], Report) else Report(
+            batch_id=req.batch_id, total=0,
+            errors=[ReportItem(sku="*", mp="wb", reason=str(results[1])[:200])],
         )
 
         # Финальный отчёт

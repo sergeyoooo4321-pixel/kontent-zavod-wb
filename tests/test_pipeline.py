@@ -31,6 +31,7 @@ async def test_run_batch_no_creds(monkeypatch):
     s3.put_public = AsyncMock(side_effect=lambda k, d, ct=None: f"https://s3/{k}")
     s3.fetch = AsyncMock(return_value=b"\xff\xd8\xff" + b"\x00" * 100)
     s3.build_key = S3Client.build_key
+    s3.start = AsyncMock()
 
     kie = MagicMock()
     kie.generate_image = AsyncMock(return_value="https://kie/x.png")
@@ -42,7 +43,7 @@ async def test_run_batch_no_creds(monkeypatch):
     req = RunRequest(
         batch_id="b1",
         chat_id=42,
-        products=[ProductIn(idx=0, sku="A", name="Кофе", tg_file_id="fid1")],
+        products=[ProductIn(idx=0, sku="A", name="Кофе", tg_file_id="AgACAgIAA-test-file-id-001")],
     )
     await run_batch(req, deps)
 

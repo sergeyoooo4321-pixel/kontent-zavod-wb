@@ -5,8 +5,11 @@ from .models import Report, ReportItem
 
 
 def _esc(s: str) -> str:
-    """Минимальный escape для Telegram Markdown."""
-    return str(s).replace("_", r"\_").replace("*", r"\*").replace("`", r"\`").replace("[", r"\[")
+    """Escape для Telegram Markdown (V1) — все потенциально ломающие символы."""
+    out = str(s)
+    for ch in ("\\", "_", "*", "`", "[", "]", "(", ")"):
+        out = out.replace(ch, f"\\{ch}")
+    return out
 
 
 def build_progress_msg(stage: str, **stats: int | str) -> str:

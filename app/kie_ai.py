@@ -36,6 +36,7 @@ class KieAIClient:
         llm_model: str = "gpt-5-2",
         poll_interval: float = 5.0,
         poll_max_attempts: int = 60,
+        max_concurrent: int = 8,
     ):
         self._base = base_url.rstrip("/")
         self._http = http
@@ -49,13 +50,31 @@ class KieAIClient:
         self._llm_model = llm_model
         self._poll_interval = poll_interval
         self._poll_max_attempts = poll_max_attempts
+        # V4 — глобальный семафор для всех запросов к kie.ai
+        self._sem = asyncio.Semaphore(max_concurrent)
+
+    async def _request_with_429(self, method: str, url: str, **kwargs) -> httpx.Response:
+        """HTTP с обработкой 429 Too Many Requests (Retry-After)."""
+        for attempt in range(3):
+            r = await self._http.request(method, url, headers=self._headers, **kwargs)
+            if r.status_code != 429:
+                return r
+            ra = 5.0
+            try:
+                ra = float(r.headers.get("Retry-After") or 5)
+            except ValueError:
+                pass
+            logger.warning("kie 429, retry-after=%s attempt=%d", ra, attempt)
+            await asyncio.sleep(min(ra, 30))
+        return r
 
     # ─── Image ──────────────────────────────────────────────────
 
     @retry(
-        retry=retry_if_exception_type(httpx.HTTPError),
+        # C3 — не-идемпотентный POST: retry только на проблемах ДО подключения
+        retry=retry_if_exception_type((httpx.ConnectError, httpx.ConnectTimeout)),
         stop=stop_after_attempt(3),
-        wait=wait_exponential(min=1, max=10),
+        wait=wait_exponential(min=1, max=5),
         reraise=True,
     )
     async def create_image_task(
@@ -77,13 +96,18 @@ class KieAIClient:
             },
         }
         if input_urls:
-            body["input"]["input_urls"] = input_urls
-        r = await self._http.post(
-            f"{self._base}/api/v1/jobs/createTask",
-            headers=self._headers,
-            json=body,
-            timeout=60.0,
-        )
+            # M8 — фильтр None/empty
+            clean = [u for u in input_urls if u]
+            if not clean:
+                raise KieAIError("createTask: input_urls all empty/None")
+            body["input"]["input_urls"] = clean
+        async with self._sem:
+            r = await self._request_with_429(
+                "POST",
+                f"{self._base}/api/v1/jobs/createTask",
+                json=body,
+                timeout=60.0,
+            )
         r.raise_for_status()
         data = r.json()
         if data.get("code") != 200:
@@ -99,12 +123,13 @@ class KieAIClient:
         for attempt in range(self._poll_max_attempts):
             await asyncio.sleep(self._poll_interval)
             try:
-                r = await self._http.get(
-                    f"{self._base}/api/v1/jobs/recordInfo",
-                    params={"taskId": task_id},
-                    headers=self._headers,
-                    timeout=30.0,
-                )
+                async with self._sem:
+                    r = await self._request_with_429(
+                        "GET",
+                        f"{self._base}/api/v1/jobs/recordInfo",
+                        params={"taskId": task_id},
+                        timeout=30.0,
+                    )
                 r.raise_for_status()
                 data = r.json().get("data", {})
             except httpx.HTTPError as e:
