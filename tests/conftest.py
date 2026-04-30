@@ -3,6 +3,13 @@ from __future__ import annotations
 
 import os
 
+# Выставляем env ДО импорта app в любых тестах
+# (Settings() читает env при загрузке модуля app.config)
+os.environ.setdefault("TG_BOT_TOKEN", "test-tg-token")
+os.environ.setdefault("KIE_API_KEY", "test-kie-key")
+os.environ.setdefault("S3_ACCESS_KEY", "test-ak")
+os.environ.setdefault("S3_SECRET_KEY", "test-sk")
+
 import pytest
 
 

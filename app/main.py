@@ -21,6 +21,13 @@ logging.basicConfig(
     level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# Отключаем INFO-логирование URL'ов в httpx — там в URL может быть токен (Telegram).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+# aiobotocore тоже шумит ключами в DEBUG
+logging.getLogger("aiobotocore").setLevel(logging.WARNING)
+logging.getLogger("botocore").setLevel(logging.WARNING)
+
 logger = logging.getLogger("cz-backend")
 
 
