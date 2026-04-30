@@ -174,6 +174,67 @@ class KieAIClient:
 
     # ─── LLM ────────────────────────────────────────────────────
 
+    async def chat_json_with_vision(
+        self,
+        *,
+        system: str,
+        user: str,
+        image_url: str,
+        model: str | None = None,
+        temperature: float = 0.4,
+        max_tokens: int | None = None,
+    ) -> dict:
+        """OpenAI-совместимый chat с image_url в content (vision).
+
+        Используется для анализа фото товара и генерации JSON-дизайн-брифа.
+        """
+        m = model or self._llm_model
+        url = f"{self._base}/{m}/v1/chat/completions"
+
+        body: dict[str, Any] = {
+            "model": m,
+            "response_format": {"type": "json_object"},
+            "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ]},
+            ],
+        }
+        if max_tokens:
+            body["max_tokens"] = max_tokens
+
+        async with self._sem:
+            r = await self._request_with_429("POST", url, json=body, timeout=180.0)
+
+        if r.status_code == 400 and "response_format" in r.text:
+            body.pop("response_format", None)
+            body["messages"][0]["content"] = system + "\n\nВажно: ответ ТОЛЬКО валидный JSON."
+            async with self._sem:
+                r = await self._request_with_429("POST", url, json=body, timeout=180.0)
+        r.raise_for_status()
+        data = r.json()
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError as e:
+            # один retry с явной подсказкой
+            body["messages"][1]["content"][0]["text"] = user + (
+                "\n\nВажно: предыдущий ответ был невалидным JSON. "
+                "Верни ТОЛЬКО JSON-объект без markdown."
+            )
+            async with self._sem:
+                r = await self._request_with_429("POST", url, json=body, timeout=180.0)
+            r.raise_for_status()
+            data = r.json()
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                raise KieAIError(f"vision LLM returned non-JSON twice: {content[:300]}") from e
+
     @retry(
         retry=retry_if_exception_type(httpx.HTTPError),
         stop=stop_after_attempt(3),

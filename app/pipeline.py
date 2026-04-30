@@ -28,10 +28,13 @@ from .models import (
 from .ozon import OzonClient, OzonError
 from .prompts import (
     build_category_prompts,
+    build_design_director_system,
+    build_design_director_user,
     build_extra_prompt,
     build_main_prompt,
     build_pack_prompt,
     build_titles_prompts,
+    compile_image_prompt,
 )
 from .reports import build_final_report_md
 from .rules import expand_to_3_skus, join_multivalue, limit_chars, nds_value, pick_from_dict, strip_brand
@@ -79,14 +82,41 @@ async def process_product_images(
             return
 
         try:
-            await deps.tg.send(chat_id, f"📥 `{state.sku}`: фото в S3 → генерю main…", parse_mode="Markdown")
+            await deps.tg.send(chat_id, f"📥 `{state.sku}`: фото в S3 → дизайн-режиссёр анализирует…", parse_mode="Markdown")
         except Exception:
             pass
 
-        # 2. MAIN ПЕРВЫМ — это эталон дизайна (с input_urls=src)
+        # 2. LLM-арт-директор смотрит на фото и сочиняет JSON-бриф дизайна
+        design_brief: dict = {}
         try:
+            design_brief = await deps.kie.chat_json_with_vision(
+                system=build_design_director_system(),
+                user=build_design_director_user(state.name, state.brand),
+                image_url=state.src_url,
+            )
+            logger.info("design_brief %s: scene=%s", state.sku,
+                        (design_brief.get("scene") or "")[:80])
+            try:
+                vibe = design_brief.get("overall_vibe") or design_brief.get("scene") or ""
+                await deps.tg.send(
+                    chat_id,
+                    f"🎨 `{state.sku}`: дизайн придуман — {vibe[:200]}\nГенерю main…",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        except Exception as e:
+            logger.warning("design_brief %s failed, fallback to generic: %s", state.sku, e)
+            design_brief = {}  # fallback на универсальный промпт
+
+        # 3. MAIN — генерим по брифу + ref=src (товар сохраняется точно)
+        try:
+            main_prompt = (
+                compile_image_prompt(design_brief, state.name, mode="main")
+                if design_brief else build_main_prompt(state.name, state.brand)
+            )
             main_kie_url = await deps.kie.generate_image(
-                prompt=build_main_prompt(state.name, state.brand),
+                prompt=main_prompt,
                 input_urls=[state.src_url],
             )
             main_bytes = await deps.s3.fetch(main_kie_url)
@@ -124,10 +154,23 @@ async def process_product_images(
                 logger.exception("unexpected %s/%s: %s", state.sku, tag, e)
                 return tag, None, f"unexpected: {e}"
 
+        # промпты для pack/extra: используем тот же design_brief если он есть
+        pack2_prompt = (
+            compile_image_prompt(design_brief, state.name, mode="pack2", qty=2)
+            if design_brief else build_pack_prompt(state.name, 2)
+        )
+        pack3_prompt = (
+            compile_image_prompt(design_brief, state.name, mode="pack3", qty=3)
+            if design_brief else build_pack_prompt(state.name, 3)
+        )
+        extra_prompt = (
+            compile_image_prompt(design_brief, state.name, mode="extra")
+            if design_brief else build_extra_prompt(state.name)
+        )
         triple = await asyncio.gather(
-            _gen("pack2", build_pack_prompt(state.name, 2)),
-            _gen("pack3", build_pack_prompt(state.name, 3)),
-            _gen("extra", build_extra_prompt(state.name)),
+            _gen("pack2", pack2_prompt),
+            _gen("pack3", pack3_prompt),
+            _gen("extra", extra_prompt),
         )
         for tag, url, err in triple:
             if url:

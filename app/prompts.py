@@ -1,7 +1,11 @@
 """JSON-структурированные промпты для kie.ai.
 
-Главное правило: design fixation. Для main — задаём строгую структуру дизайна.
-Для pack/extra — указываем «копируй reference EXACTLY, меняй только X».
+Двухступенчатая логика:
+1. Vision-LLM смотрит на фото товара и СОЧИНЯЕТ JSON-бриф дизайна (фон, палитра,
+   текстовые блоки, шрифты, декор) — индивидуально под этот товар.
+2. Image-модель использует этот бриф как промпт для генерации.
+
+Pack2/pack3/extra используют тот же бриф (с правкой qty/контента) + main как ref.
 """
 from __future__ import annotations
 
@@ -10,6 +14,223 @@ import json
 
 def _json(obj: dict) -> str:
     return json.dumps(obj, ensure_ascii=False, indent=2)
+
+
+# ─── design-director (vision LLM) ─────────────────────────────────
+
+
+def build_design_director_system() -> str:
+    """Системный промпт LLM-арт-директора. Адаптировано из user-driven brief."""
+    return (
+        "Ты — арт-директор продающих карточек товаров для Ozon и Wildberries. "
+        "Тебе показывают фото реального товара. Твоя задача — придумать "
+        "*индивидуальный* дизайн карточки, который продаёт ИМЕННО ЭТОТ товар.\n\n"
+        "Жёсткие правила (нельзя нарушать):\n"
+        "1. Внешний вид товара сохраняется ТОЧНО: упаковка, форма, пропорции, текст, "
+        "   логотипы, расположение элементов, цвет — всё как на фото.\n"
+        "2. Пропорция изображения СТРОГО 3:4 вертикальная.\n"
+        "3. Товар занимает не менее 50% площади.\n"
+        "4. Все надписи ТОЛЬКО на русском языке, без ошибок и битых букв.\n"
+        "5. Фон — *тематический под товар*, не абстракция. Например: для порошка — "
+        "   стиральная машина в размытом интерьере прачечной; для шампуня — капли "
+        "   воды и струйка волос; для кофе — тёплая чашка и зёрна на дереве; "
+        "   для гель-лака — наманикюренная рука и маникюрный салон. ТЫ САМА(А) "
+        "   подбираешь сцену под фото.\n"
+        "6. Палитра — современная, продающая, контрастная; без грязи и перегруза.\n"
+        "7. Композиция: бренд + категория сверху, 2-3 преимущества сбоку или снизу, "
+        "   плашка веса/объёма заметная.\n"
+        "8. Современные иконки/пиктограммы допустимы (но без перегруза).\n\n"
+        "Запрещено:\n"
+        "— искажать товар, менять текст на упаковке, добавлять несуществующие элементы;\n"
+        "— уменьшать товар, делать грязный или перегруженный дизайн;\n"
+        "— орфографические ошибки в русском тексте;\n"
+        "— нарушать формат 3:4.\n\n"
+        "Тон — профессиональный дизайнер, лаконично.\n\n"
+        "Ответ — СТРОГО JSON-объект (см. формат в user-сообщении). Без markdown, без префиксов."
+    )
+
+
+def build_design_director_user(
+    product_name: str,
+    brand: str | None = None,
+) -> str:
+    """User-сообщение для LLM-арт-директора. Описывает что должно быть в JSON-ответе."""
+    return (
+        "Посмотри на прикреплённое фото товара и сочини дизайн-бриф для карточки маркетплейса.\n\n"
+        f"Имя товара: {product_name}\n"
+        f"Бренд: {brand or '— не указан, придумай или возьми с упаковки'}\n\n"
+        "Верни СТРОГО следующий JSON:\n"
+        "{\n"
+        '  "category_guess": "string — что это за товар (например, шампунь, порошок, кофе)",\n'
+        '  "scene": "string — описание тематического фона (что в кадре кроме товара). '
+        'Например: \'размытая прачечная с белыми полотенцами и солнечным светом из окна\'",\n'
+        '  "palette": ["#HEX1", "#HEX2", "#HEX3"],  // 3 цвета: основной/акцент/нейтральный\n'
+        '  "mood": "string — настроение (например: чисто и свежо / уютно и тепло / премиально)",\n'
+        '  "brand_block": {\n'
+        '    "brand_text": "string — точное название бренда из упаковки",\n'
+        '    "category_text": "string — категория, 1-2 слова на русском",\n'
+        '    "position": "top-left | top-center | top-right",\n'
+        '    "style": "string — описание стиля бренд-блока"\n'
+        "  },\n"
+        '  "benefits": [\n'
+        '    "string — 1-е преимущество, короткое (до 4 слов)",\n'
+        '    "string — 2-е преимущество",\n'
+        '    "string — 3-е преимущество (опционально)"\n'
+        "  ],\n"
+        '  "benefits_style": "string — как они оформлены (pill bullets / иконки + текст / etc)",\n'
+        '  "volume_badge": {\n'
+        '    "text": "string — вес/объём/количество, если видно на упаковке (например \'250 мл\')",\n'
+        '    "style": "string — оформление (круглая яркая плашка / прямоугольный бейдж / etc)",\n'
+        '    "position": "bottom-right | bottom-left | top-right"\n'
+        "  },\n"
+        '  "typography": "string — описание шрифтов (например: \'крупный жирный sans-serif для бренда, средний для преимуществ\')",\n'
+        '  "decorations": "string — мелкие декор-элементы (брызги воды, листья, пар, искорки и т.д.) — что подходит к товару",\n'
+        '  "product_placement": "string — где и как стоит товар в кадре (центр-право, лёгкий поворот, hero-shot и т.д.)",\n'
+        '  "overall_vibe": "string — 1-2 предложения, как должна ВЫГЛЯДЕТЬ карточка целиком"\n'
+        "}\n\n"
+        "Принципы выбора:\n"
+        "• Фон должен ассоциироваться с товаром, не быть абстрактным цветным градиентом.\n"
+        "• Палитра — гармонирует с упаковкой товара, не спорит с ней.\n"
+        "• Преимущества — реальные характеристики, видимые с упаковки или очевидные из категории.\n"
+        "• Bonus: если на упаковке есть объём/вес/количество — переноси точно.\n\n"
+        "Ничего лишнего. Только JSON."
+    )
+
+
+def compile_image_prompt(
+    design: dict,
+    product_name: str,
+    mode: str,  # "main" | "pack2" | "pack3" | "extra"
+    qty: int = 1,
+) -> str:
+    """Превращает JSON-бриф от LLM-арт-директора в финальный текстовый промпт для image-модели.
+
+    Включает все требования из ТЗ + брифа, без интерпретации (дизайн уже задан LLM).
+    """
+    benefits = design.get("benefits", []) or []
+    palette = design.get("palette", []) or []
+    brand_block = design.get("brand_block", {}) or {}
+    volume = design.get("volume_badge", {}) or {}
+
+    # Build a compact spec
+    spec = {
+        "task": "premium russian marketplace product card image",
+        "aspect_ratio": "3:4 vertical",
+        "resolution": "2K",
+        "language": "ALL TEXT IN RUSSIAN ONLY. No English except brand if it's English.",
+
+        "scene_background": design.get("scene", ""),
+        "palette_hints_hex": palette,
+        "mood": design.get("mood", ""),
+
+        "product_must_be_unchanged": (
+            "EXACT same product as in the input reference image — preserve packaging shape, "
+            "label text, logos, colors, proportions. Improve lighting/contrast/sharpness only."
+        ),
+        "product_placement": design.get("product_placement", "centre, hero shot, slight 3/4 perspective"),
+        "product_size": "товар занимает не менее 50% площади кадра",
+
+        "brand_block": {
+            "text": brand_block.get("brand_text", ""),
+            "category": brand_block.get("category_text", ""),
+            "position": brand_block.get("position", "top-center"),
+            "style": brand_block.get("style", "modern bold sans-serif"),
+        },
+        "benefits": {
+            "items": benefits[:3],
+            "style": design.get("benefits_style", "pill bullets with small icons"),
+        },
+        "volume_badge": {
+            "text": volume.get("text", ""),
+            "style": volume.get("style", "circular bright accent badge"),
+            "position": volume.get("position", "bottom-right"),
+        },
+        "typography": design.get("typography", "modern Russian sans-serif (Inter/Manrope/Montserrat)"),
+        "decorations": design.get("decorations", "subtle, on-theme"),
+
+        "overall_vibe": design.get("overall_vibe", ""),
+
+        "constraints": [
+            "ALL TEXT IN RUSSIAN, NO TYPOS, NO BROKEN LETTERS",
+            "preserve product packaging exactly — no warping, no relabel",
+            "no Lorem Ipsum, no fake brand names",
+            "no clutter, professional clean composition",
+            "respect 3:4 vertical safe zones",
+        ],
+    }
+
+    if mode == "pack2" or mode == "pack3":
+        spec["pack_override"] = {
+            "product_units": qty,
+            "caption": f"«Набор {qty} штуки»",
+            "caption_position": "prominent — заменяет плашку объёма ИЛИ под брендом, крупно",
+            "design_continuity": "ВЕСЬ остальной дизайн идентичен референсу: фон, палитра, шрифты, бренд, декор",
+        }
+        spec["task"] = (
+            f"set-card showing {qty} identical units of the product, "
+            "MUST match reference design language EXACTLY"
+        )
+    elif mode == "extra":
+        spec["extra_override"] = {
+            "type": "infographic",
+            "content": "способ применения / состав / преимущества — выбери что подходит товару",
+            "layout": "3-4 визуальных блока с иконками и краткими подписями на русском",
+            "small_product_thumbnail": "опционально — миниатюра товара, не hero",
+            "design_continuity": "match reference palette, fonts, brand-block, decoration style",
+        }
+        spec["task"] = "infographic card matching the reference design language"
+
+    spec["product_name_for_context"] = product_name
+    return _json(spec)
+
+
+# ─── деприкейтнутые билдеры (оставлены для совместимости тестов) ──
+
+
+def build_main_prompt(product_name: str, brand: str | None = None) -> str:
+    """DEPRECATED: используется только если design_brief недоступен. Базовый универсальный промпт."""
+    spec = {
+        "task": "premium russian marketplace product card",
+        "aspect_ratio": "3:4 vertical",
+        "language": "ТОЛЬКО русский, без ошибок",
+        "product": product_name,
+        "brand": brand or "—",
+        "design": "themed background matching product category, hero product centre, "
+                  "brand top, 3 benefits as pill bullets, weight/volume badge bottom-right, "
+                  "modern sans-serif, professional marketplace look",
+        "constraints": ["ALL TEXT IN RUSSIAN", "no text errors", "single unit visible",
+                        "no packaging distortion"],
+    }
+    return _json(spec)
+
+
+def build_pack_prompt(product_name: str, qty: int) -> str:
+    """DEPRECATED fallback."""
+    spec = {
+        "task": f"EXACT replica of reference design but showing {qty} units",
+        "aspect_ratio": "3:4",
+        "language": "ТОЛЬКО русский",
+        "must_match_reference": "background, fonts, palette, brand block, decorations",
+        "differences": {
+            "product_count": qty,
+            "caption": f"«Набор {qty} штуки»",
+        },
+        "product": product_name,
+    }
+    return _json(spec)
+
+
+def build_extra_prompt(product_name: str) -> str:
+    """DEPRECATED fallback."""
+    spec = {
+        "task": "infographic card matching reference design language",
+        "aspect_ratio": "3:4",
+        "language": "ТОЛЬКО русский",
+        "content": "usage / composition / benefits with icons and captions",
+        "must_match_reference": "palette, typography, brand block, badges",
+        "product": product_name,
+    }
+    return _json(spec)
 
 
 # ─── images ──────────────────────────────────────────────────
