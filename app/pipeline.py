@@ -33,11 +33,8 @@ from .prompts import (
     build_extra_prompt,
     build_main_prompt,
     build_pack_prompt,
-    build_qa_system,
-    build_qa_user,
     build_titles_prompts,
     compile_image_prompt,
-    strengthen_prompt_for_retry,
 )
 from .reports import build_final_report_md
 from .rules import expand_to_3_skus, join_multivalue, limit_chars, nds_value, pick_from_dict, strip_brand
@@ -55,62 +52,6 @@ class Deps:
     s3: S3Client
     ozon: OzonClient
     wb: WBClient
-
-
-# ─── QA-loop для image-генерации ─────────────────────────────────
-
-
-async def _generate_with_qa(
-    *,
-    prompt: str,
-    ref_url: str,
-    mode: str,
-    expected: dict,
-    deps: Deps,
-    max_retries: int = 1,
-) -> tuple[str | None, list[str]]:
-    """Генерирует картинку → QA-проверка → при необходимости regenerate с усиленным промптом.
-
-    Возвращает (kie_url, warnings).
-    """
-    current_prompt = prompt
-    last_url: str | None = None
-    last_issues: list[str] = []
-    warnings: list[str] = []
-    for attempt in range(max_retries + 1):
-        try:
-            last_url = await deps.kie.generate_image(prompt=current_prompt, input_urls=[ref_url])
-        except Exception as e:
-            return None, [f"gen attempt {attempt}: {e}"]
-
-        # QA-проверка
-        try:
-            qa = await deps.kie.chat_json_with_vision(
-                system=build_qa_system(),
-                user=build_qa_user(mode, expected),
-                image_url=last_url,
-            )
-        except Exception as e:
-            logger.warning("QA %s/%s failed: %s", mode, expected.get("sku","?"), e)
-            return last_url, []  # accept без QA
-
-        ok = bool(qa.get("ok"))
-        last_issues = qa.get("issues", []) or []
-        retry_recommended = bool(qa.get("retry_recommended"))
-        severity = qa.get("severity", "low")
-
-        logger.info("qa %s ok=%s units=%s severity=%s issues=%s",
-                    mode, ok, qa.get("unit_count_visible"), severity, last_issues[:3])
-
-        if ok or not retry_recommended or attempt >= max_retries:
-            if not ok and last_issues:
-                warnings.extend(f"{mode}: {iss}" for iss in last_issues[:3])
-            return last_url, warnings
-
-        # Усиливаем промпт и повторяем
-        current_prompt = strengthen_prompt_for_retry(current_prompt, last_issues, mode, expected)
-
-    return last_url, warnings
 
 
 # ─── Этап 1: фото ────────────────────────────────────────────────
@@ -168,23 +109,16 @@ async def process_product_images(
             logger.warning("design_brief %s failed, fallback to generic: %s", state.sku, e)
             design_brief = {}  # fallback на универсальный промпт
 
-        # 3. MAIN — генерим по брифу + ref=src + QA проверка
+        # 3. MAIN — генерим по брифу + ref=src (товар сохраняется точно)
         try:
             main_prompt = (
                 compile_image_prompt(design_brief, state.name, mode="main")
                 if design_brief else build_main_prompt(state.name, state.brand)
             )
-            main_kie_url, main_warns = await _generate_with_qa(
+            main_kie_url = await deps.kie.generate_image(
                 prompt=main_prompt,
-                ref_url=state.src_url,
-                mode="main",
-                expected={"qty": 1, "name": state.name, "sku": state.sku},
-                deps=deps,
-                max_retries=1,
+                input_urls=[state.src_url],
             )
-            if not main_kie_url:
-                raise KieAIError("main: QA-loop returned no url")
-            state.warnings.extend(main_warns)
             main_bytes = await deps.s3.fetch(main_kie_url)
             state.images["main"] = await deps.s3.put_public(
                 S3Client.build_key(batch_id, state.sku, "main"), main_bytes
@@ -203,23 +137,12 @@ async def process_product_images(
             # без main pack/extra бессмысленны — выходим
             return
 
-        # 3. pack2/pack3/extra ПАРАЛЛЕЛЬНО, все используют main_url как ref + QA
+        # 3. pack2/pack3/extra ПАРАЛЛЕЛЬНО, все используют main_url как ref
         ref_url = state.images["main"]
 
-        async def _gen(tag: str, prompt: str, qty: int) -> tuple[str, str | None, str | None]:
+        async def _gen(tag: str, prompt: str) -> tuple[str, str | None, str | None]:
             try:
-                kie_url, warns = await _generate_with_qa(
-                    prompt=prompt,
-                    ref_url=ref_url,
-                    mode=tag,
-                    expected={"qty": qty, "name": state.name, "sku": state.sku},
-                    deps=deps,
-                    max_retries=1,
-                )
-                if warns:
-                    state.warnings.extend(warns)
-                if not kie_url:
-                    return tag, None, "QA-loop returned no url"
+                kie_url = await deps.kie.generate_image(prompt=prompt, input_urls=[ref_url])
                 content = await deps.s3.fetch(kie_url)
                 public = await deps.s3.put_public(
                     S3Client.build_key(batch_id, state.sku, tag), content
@@ -245,9 +168,9 @@ async def process_product_images(
             if design_brief else build_extra_prompt(state.name)
         )
         triple = await asyncio.gather(
-            _gen("pack2", pack2_prompt, 2),
-            _gen("pack3", pack3_prompt, 3),
-            _gen("extra", extra_prompt, 1),
+            _gen("pack2", pack2_prompt),
+            _gen("pack3", pack3_prompt),
+            _gen("extra", extra_prompt),
         )
         for tag, url, err in triple:
             if url:

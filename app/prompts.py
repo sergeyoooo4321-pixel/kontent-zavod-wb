@@ -97,84 +97,6 @@ def build_design_director_user(
     )
 
 
-# ─── QA-режиссёр (второй LLM, проверяет результат) ───────────────
-
-
-def build_qa_system() -> str:
-    """Системный промпт QA-проверяющего. Адаптировано из правил ТЗ."""
-    return (
-        "Ты — строгий QA-инспектор продающих карточек товаров для Ozon/Wildberries. "
-        "Тебе показывают сгенерированную картинку. Проверь её ОЧЕНЬ ВНИМАТЕЛЬНО.\n\n"
-        "Что проверять:\n"
-        "1. КОЛИЧЕСТВО ТОВАРОВ. Если в задании было «N единиц товара» — посчитай. "
-        "   Должно быть РОВНО N, не больше и не меньше.\n"
-        "2. ВНЕШНИЙ ВИД ТОВАРА. Упаковка не искажена, форма/пропорции/этикетка "
-        "   совпадают с фото-референсом. Текст на упаковке читаемый и не переврут.\n"
-        "3. ТЕКСТ. Все надписи на русском языке, без орфографических ошибок, "
-        "   без поломанных букв, без латиницы там где должен быть русский, "
-        "   без Lorem Ipsum.\n"
-        "4. КОМПОЗИЦИЯ. Соотношение сторон 3:4. Товар занимает ≥50% площади (для main/pack), "
-        "   60-70% для extra.\n"
-        "5. ДИЗАЙН. Соответствует требованиям (фон тематический, палитра гармоничная, "
-        "   шрифты современные, нет грязи и перегруза).\n\n"
-        "Отвечай СТРОГО JSON:\n"
-        "{\n"
-        '  "ok": bool,                        // true если ВСЁ ок\n'
-        '  "unit_count_visible": int,         // сколько товаров видно\n'
-        '  "issues": [string, ...],           // список конкретных проблем\n'
-        '  "retry_recommended": bool,         // имеет ли смысл перегенерить\n'
-        '  "severity": "low" | "medium" | "high"\n'
-        "}\n"
-        "Никакого markdown, только JSON."
-    )
-
-
-def build_qa_user(mode: str, expected: dict) -> str:
-    """User-сообщение для QA. expected — словарь с ожиданиями."""
-    qty = expected.get("qty", 1)
-    name = expected.get("name", "")
-    parts = [
-        f"Товар: {name}",
-        f"Тип карточки: {mode}",
-    ]
-    if mode == "main":
-        parts.append("Ожидание: 1 единица товара, hero shot, тематический фон, бренд + 2-3 преимущества + плашка веса/объёма.")
-    elif mode in ("pack2", "pack3"):
-        parts.append(f"Ожидание: РОВНО {qty} единицы товара (одинаковые), надпись «Набор {qty} штуки», тот же дизайн что у референса.")
-    elif mode == "extra":
-        parts.append("Ожидание: товар крупным планом (60-70% площади), заголовок «СПОСОБ ПРИМЕНЕНИЯ», 3-4 шага с иконками, фон в той же тематике что main.")
-    parts.append("\nПосмотри на картинку и проверь по чек-листу. Верни JSON.")
-    return "\n".join(parts)
-
-
-def strengthen_prompt_for_retry(original_prompt: str, issues: list[str], mode: str, expected: dict) -> str:
-    """Берёт оригинальный промпт и добавляет конкретные правки от QA для повторной генерации."""
-    qty = expected.get("qty", 1)
-    correction_block = {
-        "PREVIOUS_ATTEMPT_FAILED_QA": True,
-        "QA_issues_to_fix": issues[:5],
-        "EMPHASIS": [],
-    }
-    if mode in ("pack2", "pack3"):
-        correction_block["EMPHASIS"].append(
-            f"CRITICAL: show EXACTLY {qty} identical product units. Count carefully. "
-            f"Not {qty - 1}, not {qty + 1}. EXACTLY {qty}."
-        )
-        correction_block["EMPHASIS"].append(
-            "Caption «Набор {} штуки» MUST be visible and readable.".format(qty)
-        )
-    elif mode == "extra":
-        correction_block["EMPHASIS"].append(
-            "Header «СПОСОБ ПРИМЕНЕНИЯ» MUST be at top, large bold Russian font."
-        )
-        correction_block["EMPHASIS"].append(
-            "3-4 usage steps with icons MUST be visible."
-        )
-    correction_block["EMPHASIS"].append("ALL TEXT IN RUSSIAN, NO TYPOS, NO BROKEN LETTERS")
-    correction_block["EMPHASIS"].append("3:4 vertical aspect ratio strictly")
-    return original_prompt + "\n\n" + _json(correction_block)
-
-
 def compile_image_prompt(
     design: dict,
     product_name: str,
@@ -239,40 +161,15 @@ def compile_image_prompt(
 
     if mode == "pack2" or mode == "pack3":
         spec["pack_override"] = {
-            "STRICT_PRODUCT_COUNT": {
-                "exact_count": qty,
-                "must_be_exactly": qty,
-                "warning": (
-                    f"CRITICAL: in the frame there must be EXACTLY {qty} identical product units. "
-                    f"Not {qty - 1}, not {qty + 1}. Count carefully. This is the most important rule."
-                ),
-                "arrangement": "side by side or staggered, all units identical, same orientation as reference",
-            },
-            "caption": {
-                "text": f"«Набор {qty} штуки»",
-                "position": "prominent — заменяет плашку объёма ИЛИ под брендом, крупно, читаемо",
-                "style": "тот же шрифт что у бренда на main, контрастный",
-            },
-            "design_continuity": {
-                "MUST_BE_IDENTICAL_TO_REFERENCE": [
-                    "background scene and angle",
-                    "palette (every color)",
-                    "typography (font family, size, weight, color)",
-                    "brand block style and position",
-                    "decorations (waterdrops, leaves, etc.)",
-                    "lighting and mood",
-                    "overall composition vibe",
-                ],
-                "NO_NEW_DESIGN_ELEMENTS": True,
-            },
+            "product_units": qty,
+            "caption": f"«Набор {qty} штуки»",
+            "caption_position": "prominent — заменяет плашку объёма ИЛИ под брендом, крупно",
+            "design_continuity": "ВЕСЬ остальной дизайн идентичен референсу: фон, палитра, шрифты, бренд, декор",
         }
         spec["task"] = (
-            f"SET-CARD showing EXACTLY {qty} identical units of the product. "
-            "MUST match reference design language EXACTLY (background/palette/fonts/brand/decor)."
+            f"set-card showing {qty} identical units of the product, "
+            "MUST match reference design language EXACTLY"
         )
-    elif mode == "pack3" and qty != 3:
-        # safeguard
-        pass
     elif mode == "extra":
         spec["extra_override"] = {
             "type": "usage_instructions_card",
