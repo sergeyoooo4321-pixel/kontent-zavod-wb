@@ -25,6 +25,21 @@ class KieAITimeout(KieAIError):
     pass
 
 
+def _strip_json_markdown(content: str) -> str:
+    """Убирает markdown-обёртку ```json ... ``` если модель её добавила."""
+    s = content.strip()
+    if s.startswith("```"):
+        # cut opening fence (```json или просто ```)
+        nl = s.find("\n")
+        if nl > 0:
+            s = s[nl + 1:]
+        # cut closing fence
+        if s.endswith("```"):
+            s = s[:-3]
+        s = s.strip()
+    return s
+
+
 class KieAIClient:
     def __init__(
         self,
@@ -218,12 +233,12 @@ class KieAIClient:
         data = r.json()
         content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
         try:
-            return json.loads(content)
+            return json.loads(_strip_json_markdown(content))
         except json.JSONDecodeError as e:
             # один retry с явной подсказкой
             body["messages"][1]["content"][0]["text"] = user + (
                 "\n\nВажно: предыдущий ответ был невалидным JSON. "
-                "Верни ТОЛЬКО JSON-объект без markdown."
+                "Верни ТОЛЬКО JSON-объект без markdown-обёртки ```json ```."
             )
             async with self._sem:
                 r = await self._request_with_429("POST", url, json=body, timeout=180.0)
@@ -231,7 +246,7 @@ class KieAIClient:
             data = r.json()
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
             try:
-                return json.loads(content)
+                return json.loads(_strip_json_markdown(content))
             except json.JSONDecodeError:
                 raise KieAIError(f"vision LLM returned non-JSON twice: {content[:300]}") from e
 
@@ -280,13 +295,12 @@ class KieAIClient:
 
         content = await _call()
         try:
-            return json.loads(content)
+            return json.loads(_strip_json_markdown(content))
         except json.JSONDecodeError:
-            # Один retry с явной подсказкой
             content = await _call(
                 "\n\nВажно: предыдущий ответ был невалидным JSON. Верни ТОЛЬКО JSON-объект без markdown-обёртки."
             )
             try:
-                return json.loads(content)
+                return json.loads(_strip_json_markdown(content))
             except json.JSONDecodeError as e:
                 raise KieAIError(f"LLM returned non-JSON twice: {content[:300]}") from e
