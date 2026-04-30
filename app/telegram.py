@@ -113,3 +113,46 @@ class TelegramClient:
         """Удобный шорткат: file_id → bytes."""
         path = await self.get_file_path(file_id)
         return await self.download_file(path)
+
+    @retry(
+        retry=retry_if_exception_type((httpx.NetworkError, httpx.ReadTimeout)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=10),
+        reraise=True,
+    )
+    async def send_media_group(
+        self,
+        chat_id: int,
+        photos: list[tuple[str, str | None]],  # [(url, caption?), ...]
+    ) -> None:
+        """Отправить альбом фото (до 10 штук) одним сообщением.
+
+        photos: список кортежей (url, caption). Caption ставится только на ПЕРВОМ
+        элементе альбома (Telegram показывает его под всем альбомом).
+        """
+        if not photos:
+            return
+        media = []
+        for i, (url, caption) in enumerate(photos[:10]):
+            item = {"type": "photo", "media": url}
+            if i == 0 and caption:
+                item["caption"] = caption[:1024]  # лимит
+                item["parse_mode"] = "Markdown"
+            media.append(item)
+        body = {"chat_id": chat_id, "media": media}
+        try:
+            r = await self._http.post(f"{self._url}/sendMediaGroup", json=body)
+            if r.status_code >= 400:
+                # Если Markdown сломался — повторим без parse_mode
+                if media[0].get("parse_mode"):
+                    media[0].pop("parse_mode", None)
+                    r = await self._http.post(f"{self._url}/sendMediaGroup", json=body)
+        except httpx.HTTPStatusError as e:
+            raise TelegramError(f"sendMediaGroup {e.response.status_code}") from None
+        if r.status_code >= 400:
+            logger.warning("sendMediaGroup %s: %s", r.status_code, r.text[:200])
+            # Фолбэк: отправить как простые ссылки текстом
+            text = "\n".join(f"• {u}" for u, _ in photos)
+            await self.send(chat_id, text, parse_mode=None)
+            return
+        logger.info("tg.media_group chat_id=%s count=%d", chat_id, len(media))

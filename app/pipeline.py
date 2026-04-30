@@ -116,14 +116,39 @@ async def process_product_images(
                 state.errors.append(f"{tag}: {err}")
 
         ok = len(state.images)
+        # Шлём сами фото альбомом (до 4 шт) с подписью
         try:
-            await deps.tg.send(
-                chat_id,
-                f"🖼 `{state.sku}`: {ok}/4 фото готовы",
-                parse_mode="Markdown",
-            )
+            tags_order = [("main", "Главное"), ("pack2", "Набор 2 шт"),
+                          ("pack3", "Набор 3 шт"), ("extra", "Доп. фото")]
+            photos = []
+            for tag, label in tags_order:
+                url = state.images.get(tag)
+                if url:
+                    cap = f"*{state.sku}* — {label}" if not photos else label
+                    photos.append((url, cap if not photos else None))
+            # Первый кортеж — с общей подписью на весь альбом
+            if photos:
+                first_url, _ = photos[0]
+                summary_caption = (
+                    f"🖼 *{state.sku}* — {ok}/4 фото\n"
+                    f"main / pack2 / pack3 / extra"
+                )
+                photos[0] = (first_url, summary_caption)
+                await deps.tg.send_media_group(chat_id, photos)
+            # Плюс текстовое сообщение со ссылками для удобства копирования
+            urls_text_lines = [f"📎 *Ссылки {state.sku}:*"]
+            for tag, label in tags_order:
+                url = state.images.get(tag)
+                if url:
+                    urls_text_lines.append(f"• {label}: {url}")
+            await deps.tg.send(chat_id, "\n".join(urls_text_lines), parse_mode="Markdown")
         except Exception as e:
-            logger.warning("tg.send images-status %s: %s", state.sku, e)
+            logger.warning("tg.send media %s: %s", state.sku, e)
+            # Фолбэк — короткий статус
+            try:
+                await deps.tg.send(chat_id, f"🖼 `{state.sku}`: {ok}/4 фото", parse_mode="Markdown")
+            except Exception:
+                pass
 
 
 # ─── Этап 2: категории ───────────────────────────────────────────
