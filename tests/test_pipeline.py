@@ -22,7 +22,6 @@ async def test_run_batch_no_creds(monkeypatch):
     cfg.settings.MAX_PARALLEL_PRODUCTS = 1
     cfg.settings.KIE_POLL_INTERVAL_SEC = 0.001
     cfg.settings.KIE_POLL_MAX_ATTEMPTS = 1
-    cfg.settings.PIPELINE_MODE = "legacy"  # hybrid требует rembg/playwright
 
     tg = MagicMock()
     tg.send = AsyncMock(return_value={"ok": True})

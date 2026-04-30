@@ -262,40 +262,6 @@ def compile_image_prompt(
     return prompt
 
 
-def compile_bg_only_prompt(brief: dict, mode: str) -> str:
-    """Промпт для генерации ТОЛЬКО фона/сцены, без товара.
-
-    Используется в гибридном pipeline (refactor_plan.md §4), где товар вырезается
-    rembg и накладывается отдельно через PIL composite. Задача image-модели здесь —
-    создать чистую тематическую сцену с пустой центральной зоной для товара.
-    """
-    design = brief.get("design") or (brief if "scene" in brief else {})
-    scene = design.get("scene", "clean studio with soft natural light")
-    mood = design.get("mood", "clean, fresh, professional")
-    palette = design.get("palette", []) or []
-
-    # Под main / pack2 / pack3 / extra — слегка разные сцены чтобы серия не была одинаковой
-    scene_variant = {
-        "main": "wide hero shot, product placement zone in the center-bottom of frame",
-        "pack2": "same scene but slightly different angle, central zone wide enough for two items",
-        "pack3": "same scene but pulled back, central zone wide enough for three items",
-        "extra": "tighter close-up of the same scene, central zone for hero product, bottom area clean for usage steps",
-    }.get(mode, "central zone empty for product placement")
-
-    palette_hex = ", ".join(palette) if palette else "neutral palette"
-
-    return (
-        f"3:4 vertical Russian marketplace card BACKGROUND ONLY, 2K resolution. "
-        f"Scene: {scene}. {scene_variant}. Mood: {mood}. "
-        f"IMPORTANT: NO PRODUCTS in the image. NO objects in the central placement zone — "
-        f"keep it visually clean and slightly empty so a product can be placed there separately. "
-        f"Soft natural lighting, slight depth of field, clean composition. "
-        f"Background only — like a stage waiting for an item. "
-        f"Palette hint: {palette_hex}. "
-        f"No text, no logos, no labels. Just the environment."
-    )
-
-
 # LEGACY: keep for fallback, see refactor_plan.md §3.
 # Старая версия compile_image_prompt — стена JSON со 100+ полями. Image-модели парсят
 # промпт линейно как обычный текст, поэтому глубокий JSON работает хуже естественного.

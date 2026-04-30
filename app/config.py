@@ -1,8 +1,6 @@
 """Конфигурация: pydantic-settings, читает из env / .env файла."""
 from __future__ import annotations
 
-from typing import Literal
-
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -26,11 +24,6 @@ class Settings(BaseSettings):
     KIE_LLM_MODEL: str = "gpt-5-2"
     KIE_POLL_INTERVAL_SEC: float = 5.0
     KIE_POLL_MAX_ATTEMPTS: int = 60
-
-    # Pipeline mode (refactor_plan.md §4):
-    # legacy — старый: 4 параллельные edit-генерации от src.
-    # hybrid — новый: rembg + AI-фон + PIL composite + Playwright plashki.
-    PIPELINE_MODE: Literal["legacy", "hybrid"] = "hybrid"
 
     # Yandex Object Storage
     S3_ENDPOINT: str = "https://storage.yandexcloud.net"
