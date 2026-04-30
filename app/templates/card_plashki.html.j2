@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@600;700;800;900&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Manrope', sans-serif; }
+  body { background: transparent; width: 1536px; height: 2048px; position: relative; }
+
+  /* ── Бренд-блок (top-center) ── */
+  .brand-block {
+    position: absolute; top: 80px; left: 50%; transform: translateX(-50%);
+    background: white; border-radius: 80px; padding: 30px 70px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.1);
+    text-align: center;
+  }
+  .brand-text { font-size: 90px; font-weight: 900; color: {{ brand_color | default('#E2231A') }}; line-height: 1; }
+  .category-text { font-size: 50px; font-weight: 700; color: {{ category_color | default('#00AEEF') }}; margin-top: 8px; }
+
+  /* ── Бенефиты (left side) ── */
+  .benefits {
+    position: absolute; top: 50%; left: 40px; transform: translateY(-50%);
+    display: flex; flex-direction: column; gap: 24px;
+  }
+  .benefit {
+    display: flex; align-items: center; gap: 18px;
+    background: white; border-radius: 50px; padding: 18px 32px;
+    box-shadow: 0 3px 14px rgba(0,0,0,.08);
+    max-width: 400px;
+  }
+  .benefit-check {
+    width: 50px; height: 50px; border-radius: 50%; background: #E2231A;
+    display: flex; align-items: center; justify-content: center;
+    color: white; font-size: 32px; font-weight: 900; flex-shrink: 0;
+  }
+  .benefit-text { font-size: 28px; font-weight: 700; color: #1a1a1a; line-height: 1.15; }
+
+  /* ── Объёмная плашка (bottom-right) ── */
+  .volume-badge {
+    position: absolute; bottom: 80px; right: 80px;
+    width: 200px; height: 200px; border-radius: 50%;
+    background: #E2231A; color: white;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 56px; font-weight: 900;
+    box-shadow: 0 6px 24px rgba(226,35,26,.4);
+  }
+
+  /* ── Капция набора (если есть) ── */
+  .units-caption {
+    position: absolute; top: 380px; left: 50%; transform: translateX(-50%);
+    background: #E2231A; color: white;
+    padding: 20px 50px; border-radius: 60px;
+    font-size: 56px; font-weight: 900;
+    box-shadow: 0 6px 20px rgba(226,35,26,.35);
+  }
+</style>
+</head>
+<body>
+
+  {% if brand_text %}
+  <div class="brand-block">
+    <div class="brand-text">{{ brand_text }}</div>
+    {% if category_text %}<div class="category-text">{{ category_text }}</div>{% endif %}
+  </div>
+  {% endif %}
+
+  {% if units_caption %}
+  <div class="units-caption">{{ units_caption }}</div>
+  {% endif %}
+
+  {% if benefits %}
+  <div class="benefits">
+    {% for b in benefits[:3] %}
+    <div class="benefit">
+      <div class="benefit-check">&#10003;</div>
+      <div class="benefit-text">{{ b }}</div>
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% if volume_text %}
+  <div class="volume-badge">{{ volume_text }}</div>
+  {% endif %}
+
+</body>
+</html>

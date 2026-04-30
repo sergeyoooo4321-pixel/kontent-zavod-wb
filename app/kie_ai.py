@@ -100,8 +100,17 @@ class KieAIClient:
         aspect_ratio: str = "3:4",
         resolution: str = "2K",
         model: str | None = None,
+        image_weight: float | None = None,
+        guidance_scale: float | None = None,
+        seed: int | None = None,
     ) -> str:
-        """POST /api/v1/jobs/createTask, возвращает taskId."""
+        """POST /api/v1/jobs/createTask, возвращает taskId.
+
+        Опциональные параметры image_weight / guidance_scale / seed нужны для
+        edit-моделей вроде flux-kontext-pro и nano-banana-pro, где они влияют
+        на консистентность товара между генерациями. Для gpt-image-2 эти поля
+        обычно игнорируются API. Если не передаётся — поле в payload не идёт.
+        """
         body: dict[str, Any] = {
             "model": model or self._image_model,
             "input": {
@@ -116,6 +125,12 @@ class KieAIClient:
             if not clean:
                 raise KieAIError("createTask: input_urls all empty/None")
             body["input"]["input_urls"] = clean
+        if image_weight is not None:
+            body["input"]["image_weight"] = image_weight
+        if guidance_scale is not None:
+            body["input"]["guidance_scale"] = guidance_scale
+        if seed is not None:
+            body["input"]["seed"] = seed
         async with self._sem:
             r = await self._request_with_429(
                 "POST",
@@ -163,10 +178,81 @@ class KieAIClient:
                 logger.info("kie.poll success taskId=%s url=%s", task_id, urls[0][:80])
                 return urls[0]
             if state == "fail":
-                msg = data.get("failMsg") or json.dumps(data)[:300]
-                raise KieAIError(f"task {task_id} failed: {msg}")
+                fail_msg = data.get("failMsg") or json.dumps(data)[:300]
+                logger.error("kie.poll FAIL taskId=%s msg=%s", task_id, fail_msg)
+                raise KieAIError(f"task {task_id} failed: {fail_msg}")
             # waiting / queuing / generating — продолжаем
         raise KieAITimeout(f"task {task_id} timeout after {self._poll_max_attempts} attempts")
+
+    async def create_image_task_with_retry(
+        self,
+        *,
+        prompt: str,
+        input_urls: list[str] | None = None,
+        aspect_ratio: str = "3:4",
+        resolution: str = "2K",
+        model: str | None = None,
+        image_weight: float | None = None,
+        guidance_scale: float | None = None,
+        seed: int | None = None,
+        max_retries: int = 2,
+    ) -> str:
+        """create_image_task с экспоненциальным retry на сетевые ошибки И KieAIError.
+
+        Прикрытие для редких сценариев когда kie.ai возвращает временную ошибку
+        в API-ответе (code != 200) или сеть моргает — делаем 1+max_retries попыток.
+        """
+        last_err: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                return await self.create_image_task(
+                    prompt=prompt,
+                    input_urls=input_urls,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    model=model,
+                    image_weight=image_weight,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                )
+            except (KieAIError, httpx.HTTPError) as e:
+                last_err = e
+                logger.warning(
+                    "kie.create_image_task retry %d/%d: %s",
+                    attempt + 1, max_retries + 1, e,
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+        raise KieAIError(
+            f"create_image_task failed after {max_retries + 1} attempts: {last_err}"
+        )
+
+    async def generate_image_with_retry(
+        self,
+        *,
+        prompt: str,
+        input_urls: list[str] | None = None,
+        aspect_ratio: str = "3:4",
+        resolution: str = "2K",
+        model: str | None = None,
+        image_weight: float | None = None,
+        guidance_scale: float | None = None,
+        seed: int | None = None,
+        max_retries: int = 2,
+    ) -> str:
+        """create_image_task_with_retry + poll → URL результата."""
+        task_id = await self.create_image_task_with_retry(
+            prompt=prompt,
+            input_urls=input_urls,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            model=model,
+            image_weight=image_weight,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            max_retries=max_retries,
+        )
+        return await self.poll_image_task(task_id)
 
     async def generate_image(
         self,
@@ -176,6 +262,9 @@ class KieAIClient:
         aspect_ratio: str = "3:4",
         resolution: str = "2K",
         model: str | None = None,
+        image_weight: float | None = None,
+        guidance_scale: float | None = None,
+        seed: int | None = None,
     ) -> str:
         """createTask + poll → URL результата."""
         task_id = await self.create_image_task(
@@ -184,6 +273,9 @@ class KieAIClient:
             aspect_ratio=aspect_ratio,
             resolution=resolution,
             model=model,
+            image_weight=image_weight,
+            guidance_scale=guidance_scale,
+            seed=seed,
         )
         return await self.poll_image_task(task_id)
 

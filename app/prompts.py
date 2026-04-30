@@ -111,16 +111,201 @@ def compile_image_prompt(
     mode: str,  # "main" | "pack2" | "pack3" | "extra"
     qty: int = 1,
 ) -> str:
-    """Превращает JSON-бриф (identity + design) в финальный image-промпт.
+    """Собирает промпт для image-модели как естественный английский текст.
 
-    Каждый промпт начинается с IDENTITY_LOCK секции — модель не имеет права
-    менять упаковку товара. Дизайн (фон, плашки) приходит из design-секции.
+    На вход — JSON-бриф от vision LLM:
+      {
+        "identity": {shape, proportions, colors_packaging, label_text, brand_visual, key_features, ...},
+        "design":   {category_guess, scene, palette, brand_block, benefits, volume_badge, ...}
+      }
+
+    На выходе — одна строка ~200 слов на английском (image-модели лучше парсят EN).
+    Все user-facing надписи на карточке — на русском (через quoted text в промпте).
+
+    Принципы (см. refactor_plan.md §3):
+      • Естественный текст, не JSON. Image-модели не парсят структуру.
+      • Идентичность товара через визуальное описание ("white plastic pouch with red logo"),
+        а не через абстрактные do_not_change: ["shape", "proportions"].
+      • Запреты формулируются позитивно — "keep packaging identical to reference".
+      • Один сценарий на промпт. Никаких вложенных оверрайдов с условиями.
+      • Бенефиты, плашки, бренд-блок — описаны конкретно, с цветом и расположением.
+      • Палитра — в HEX в самом конце, как реминд для модели.
 
     brief может быть в двух форматах:
-    - {"identity": {...}, "design": {...}}  — новый формат
-    - {"scene": ..., "palette": ...}        — старый (для обратной совместимости)
+      - {"identity": {...}, "design": {...}}  — новый формат
+      - {"scene": ..., "palette": ...}        — старый (для обратной совместимости)
     """
-    # Поддерживаем оба формата
+    identity = brief.get("identity") or {}
+    design = brief.get("design") or (brief if "scene" in brief else {})
+
+    # ── Блок 1: общее описание сцены ──────────────────────
+    aspect = "3:4 vertical Russian marketplace product card, 2K resolution"
+    scene = design.get("scene", "clean studio background with soft natural light")
+    mood = design.get("mood", "clean, fresh, professional")
+
+    # ── Блок 2: визуальное описание товара (identity) ─────
+    shape = identity.get("shape", "")
+    proportions = identity.get("proportions", "")
+    colors = identity.get("colors_packaging", []) or []
+    label_text = identity.get("label_text", "")
+    brand_visual = identity.get("brand_visual", "")
+    key_features = identity.get("key_features", []) or []
+
+    product_desc_parts = ["The product is the SAME as in the reference image:"]
+    if shape:
+        product_desc_parts.append(f"{shape}.")
+    if proportions:
+        product_desc_parts.append(f"{proportions}.")
+    if colors:
+        product_desc_parts.append(f"Packaging colors: {', '.join(colors)}.")
+    else:
+        product_desc_parts.append("Packaging colors: as in reference.")
+    if brand_visual:
+        product_desc_parts.append(f"Label visual: {brand_visual}.")
+    if label_text:
+        product_desc_parts.append(f'Label text reads: "{label_text}".')
+    if key_features:
+        product_desc_parts.append(f"Key visual features: {', '.join(key_features)}.")
+    product_desc_parts.append(
+        "Keep packaging identical to reference — same shape, same colors, "
+        "same logo, same label text, same proportions. Only relight, do not redesign."
+    )
+    product_desc = " ".join(product_desc_parts)
+
+    # ── Блок 3: композиция (зависит от mode) ──────────────
+    if mode == "main":
+        composition = (
+            "Composition: single product centered, taking 50–60% of frame, "
+            "slight soft shadow underneath, slight 3/4 angle for depth."
+        )
+        units_caption = ""
+    elif mode == "pack2":
+        composition = (
+            "Composition: TWO IDENTICAL product packages side by side, centered, "
+            "same lighting on both, same shadow direction. Both products are 100% identical "
+            "to each other and to the reference. Spacing between them is moderate, "
+            "they don't overlap."
+        )
+        units_caption = '"Набор 2 штуки" prominently displayed near the top.'
+    elif mode == "pack3":
+        composition = (
+            "Composition: THREE IDENTICAL product packages arranged in a fan/row, "
+            "centered, same lighting and same shadow direction on all three. "
+            "All three products are 100% identical to each other and to the reference. "
+            "Slight overlap or moderate spacing — readable composition."
+        )
+        units_caption = '"Набор 3 штуки" prominently displayed near the top.'
+    elif mode == "extra":
+        composition = (
+            "Composition: single product centered, taking 60–70% of frame, "
+            "hero shot, slight angle. Plus 3-4 small numbered step icons at the bottom "
+            "with short Russian captions describing how to use the product "
+            "(based on category). Top header: «СПОСОБ ПРИМЕНЕНИЯ» in bold."
+        )
+        units_caption = ""
+    else:
+        composition = "Composition: single product centered."
+        units_caption = ""
+
+    # ── Блок 4: design (фон, плашки, бренд-блок) ──────────
+    brand_block = design.get("brand_block", {}) or {}
+    benefits = design.get("benefits", []) or []
+    volume = design.get("volume_badge", {}) or {}
+    palette = design.get("palette", []) or []
+
+    brand_text = brand_block.get("brand_text", "")
+    category_text = brand_block.get("category_text", "")
+    brand_pos = brand_block.get("position", "top-center")
+
+    benefits_text = ""
+    if benefits:
+        items = " · ".join(f'"{b}"' for b in benefits[:3])
+        benefits_text = (
+            f"On the left side: {len(benefits[:3])} benefit badges, each is a "
+            f"small white pill with a red circle containing a white checkmark, "
+            f"followed by Russian text: {items}. Stack them vertically."
+        )
+
+    volume_text = ""
+    if volume.get("text") and mode == "main":
+        volume_text = (
+            f'Bottom-right corner: red circular badge with white text "{volume["text"]}".'
+        )
+
+    brand_text_block = ""
+    if brand_text:
+        brand_text_block = (
+            f'{brand_pos.title()}: brand block with "{brand_text}"'
+            + (f' / "{category_text}"' if category_text else '')
+            + ' in bold sans-serif on a clean rounded pill background.'
+        )
+
+    palette_hex = ", ".join(palette) if palette else "neutral palette matching the product"
+
+    # ── Блок 5: финальная сборка ──────────────────────────
+    parts = [
+        f"{aspect}.",
+        f"Scene: {scene}. Mood: {mood}.",
+        product_desc,
+        composition,
+        brand_text_block,
+        benefits_text,
+        units_caption,
+        volume_text,
+        f"Palette hint: {palette_hex}.",
+        "All on-card text in Russian only, no typos, no broken letters, "
+        "clean modern sans-serif typography. No clutter, professional clean composition. "
+        "Respect 3:4 vertical safe zones — important text away from edges.",
+    ]
+
+    prompt = " ".join(p.strip() for p in parts if p.strip())
+    return prompt
+
+
+def compile_bg_only_prompt(brief: dict, mode: str) -> str:
+    """Промпт для генерации ТОЛЬКО фона/сцены, без товара.
+
+    Используется в гибридном pipeline (refactor_plan.md §4), где товар вырезается
+    rembg и накладывается отдельно через PIL composite. Задача image-модели здесь —
+    создать чистую тематическую сцену с пустой центральной зоной для товара.
+    """
+    design = brief.get("design") or (brief if "scene" in brief else {})
+    scene = design.get("scene", "clean studio with soft natural light")
+    mood = design.get("mood", "clean, fresh, professional")
+    palette = design.get("palette", []) or []
+
+    # Под main / pack2 / pack3 / extra — слегка разные сцены чтобы серия не была одинаковой
+    scene_variant = {
+        "main": "wide hero shot, product placement zone in the center-bottom of frame",
+        "pack2": "same scene but slightly different angle, central zone wide enough for two items",
+        "pack3": "same scene but pulled back, central zone wide enough for three items",
+        "extra": "tighter close-up of the same scene, central zone for hero product, bottom area clean for usage steps",
+    }.get(mode, "central zone empty for product placement")
+
+    palette_hex = ", ".join(palette) if palette else "neutral palette"
+
+    return (
+        f"3:4 vertical Russian marketplace card BACKGROUND ONLY, 2K resolution. "
+        f"Scene: {scene}. {scene_variant}. Mood: {mood}. "
+        f"IMPORTANT: NO PRODUCTS in the image. NO objects in the central placement zone — "
+        f"keep it visually clean and slightly empty so a product can be placed there separately. "
+        f"Soft natural lighting, slight depth of field, clean composition. "
+        f"Background only — like a stage waiting for an item. "
+        f"Palette hint: {palette_hex}. "
+        f"No text, no logos, no labels. Just the environment."
+    )
+
+
+# LEGACY: keep for fallback, see refactor_plan.md §3.
+# Старая версия compile_image_prompt — стена JSON со 100+ полями. Image-модели парсят
+# промпт линейно как обычный текст, поэтому глубокий JSON работает хуже естественного.
+# Не удаляю — может понадобиться откатить если новая версия даст худший результат.
+def _compile_image_prompt_legacy(
+    brief: dict,
+    product_name: str,
+    mode: str,
+    qty: int = 1,
+) -> str:
     identity = brief.get("identity") or {}
     design = brief.get("design") or (brief if "scene" in brief else {})
 
@@ -129,7 +314,6 @@ def compile_image_prompt(
     brand_block = design.get("brand_block", {}) or {}
     volume = design.get("volume_badge", {}) or {}
 
-    # IDENTITY_LOCK — обязательная секция в каждом промпте
     identity_lock = {
         "rule": (
             "Use the EXACT SAME product from the reference image (input_urls). "
@@ -154,25 +338,21 @@ def compile_image_prompt(
         ],
     }
 
-    # Build a compact spec — IDENTITY_LOCK всегда первым
     spec = {
         "IDENTITY_LOCK": identity_lock,
         "task": "premium russian marketplace product card image",
         "aspect_ratio": "3:4 vertical",
         "resolution": "2K",
         "language": "ALL TEXT IN RUSSIAN ONLY. No English except brand if it's English.",
-
         "scene_background": design.get("scene", ""),
         "palette_hints_hex": palette,
         "mood": design.get("mood", ""),
-
         "product_must_be_unchanged": (
             "EXACT same product as in the input reference image — preserve packaging shape, "
             "label text, logos, colors, proportions. Improve lighting/contrast/sharpness only."
         ),
         "product_placement": design.get("product_placement", "centre, hero shot, slight 3/4 perspective"),
         "product_size": "товар занимает не менее 50% площади кадра",
-
         "brand_block": {
             "text": brand_block.get("brand_text", ""),
             "category": brand_block.get("category_text", ""),
@@ -190,9 +370,7 @@ def compile_image_prompt(
         },
         "typography": design.get("typography", "modern Russian sans-serif (Inter/Manrope/Montserrat)"),
         "decorations": design.get("decorations", "subtle, on-theme"),
-
         "overall_vibe": design.get("overall_vibe", ""),
-
         "constraints": [
             "ALL TEXT IN RUSSIAN, NO TYPOS, NO BROKEN LETTERS",
             "preserve product packaging exactly — no warping, no relabel",
@@ -202,7 +380,7 @@ def compile_image_prompt(
         ],
     }
 
-    if mode == "pack2" or mode == "pack3":
+    if mode in ("pack2", "pack3"):
         spec["pack_override"] = {
             "product_units": qty,
             "caption": f"«Набор {qty} штуки»",
@@ -218,48 +396,21 @@ def compile_image_prompt(
             "type": "usage_instructions_card",
             "header_text": {
                 "content": "«СПОСОБ ПРИМЕНЕНИЯ»",
-                "style": (
-                    "крупный жирный заголовок сверху, красивый продающий русский шрифт, "
-                    "контрастный к фону, ВСЕ ЗАГЛАВНЫМИ или капс-стиль"
-                ),
+                "style": "крупный жирный заголовок сверху, контрастный к фону",
                 "position": "top centre, prominent",
             },
-            "product_size": (
-                "товар КРУПНЕЕ чем на main — занимает 60-70% площади кадра, "
-                "хорошо видны детали упаковки и текст этикетки"
-            ),
-            "product_placement": "центр или центр-низ, hero-shot, чуть наклонён или 3/4",
+            "product_size": "товар занимает 60-70% площади кадра",
+            "product_placement": "центр или центр-низ, hero-shot, 3/4",
             "usage_steps": {
-                "count": "3-4 шага применения, последовательно",
-                "format": "иконка + короткая русская подпись (1-3 слова)",
-                "examples_by_category": {
-                    "чистящее средство": ["1. Нанести", "2. Распределить", "3. Подождать", "4. Смыть"],
-                    "шампунь": ["1. Нанести на влажные волосы", "2. Вспенить", "3. Смыть водой"],
-                    "крем": ["1. Очистить кожу", "2. Нанести", "3. Втирать массажными движениями"],
-                    "кофе": ["1. Залить горячей водой", "2. Подождать 4 мин", "3. Наслаждаться"],
-                    "default": "придумай шаги применения логично под этот товар",
-                },
-                "style": "минималистичные иконки в стиле линейная графика или плоские, цвета из палитры",
-                "position": "снизу или вдоль одного края — НЕ перекрывает товар",
+                "count": "3-4 шага применения",
+                "format": "иконка + короткая русская подпись",
+                "position": "снизу или вдоль одного края",
             },
-            "background_variation": (
-                "ТА ЖЕ тематика что у main (та же сцена/окружение), но КОМПОЗИЦИЯ слегка изменена — "
-                "другой ракурс, другой план, другое время суток, другие декор-элементы из той же темы. "
-                "НЕ дубликат main. Примеры: для main «кухонная раковина общим планом» — extra «крупный план "
-                "на той же раковине с каплями воды»; для main «прачечная общим планом» — extra «полки с бельём в той же прачечной»."
-            ),
-            "design_continuity": (
-                "ОБЯЗАТЕЛЬНО совпадает с reference (main): палитра, шрифты, бренд-блок, стиль декора, общая стилистика"
-            ),
-            "no_brand_block_needed": False,
-            "language": "ВСЕ НАДПИСИ НА РУССКОМ ЯЗЫКЕ, без ошибок",
+            "background_variation": "та же тематика что у main, но другой ракурс/план",
+            "design_continuity": "совпадает с reference (main)",
+            "language": "ВСЕ НАДПИСИ НА РУССКОМ ЯЗЫКЕ",
         }
-        spec["task"] = (
-            "Карточка «Способ применения» — тот же товар крупным планом, "
-            "та же тематическая сцена что на main (но в чуть изменённом ракурсе/композиции), "
-            "крупный красивый заголовок «СПОСОБ ПРИМЕНЕНИЯ», 3-4 шага с иконками. "
-            "MUST match reference design language."
-        )
+        spec["task"] = "Карточка «Способ применения» — товар крупным планом + 3-4 шага"
 
     spec["product_name_for_context"] = product_name
     return _json(spec)
