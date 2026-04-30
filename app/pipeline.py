@@ -69,8 +69,11 @@ async def process_product_images(
             src_key = S3Client.build_key(batch_id, state.sku, "src")
             state.src_url = await deps.s3.put_public(src_key, raw, "image/jpeg")
         except Exception as e:
-            state.errors.append(f"src: {e}")
-            logger.exception("src upload %s: %s", state.sku, e)
+            # маскируем токен в репрезентации ошибки (httpx URL может содержать его)
+            from .telegram import _mask_token
+            msg = _mask_token(str(e))
+            state.errors.append(f"src: {msg}")
+            logger.error("src upload %s: %s", state.sku, msg)
             return  # без исходного фото нет смысла продолжать
 
         # отдельный try чтобы tg.send-ошибка не валила pipeline

@@ -1,7 +1,11 @@
-"""Telegram Bot API клиент: sendMessage, getFile, downloadFile."""
+"""Telegram Bot API клиент: sendMessage, getFile, downloadFile.
+
+Все исключения httpx маскируют токен в URL перед re-raise / логированием.
+"""
 from __future__ import annotations
 
 import logging
+import re
 
 import httpx
 from tenacity import (
@@ -12,6 +16,14 @@ from tenacity import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_\-]+")
+
+
+def _mask_token(text: str) -> str:
+    """Маскирует TG bot токен в любой строке (URL, error message)."""
+    return _TOKEN_RE.sub("bot<TOKEN>", text or "")
 
 
 class TelegramError(Exception):
@@ -70,8 +82,12 @@ class TelegramClient:
     )
     async def get_file_path(self, file_id: str) -> str:
         """Получить file_path для последующего скачивания."""
-        r = await self._http.get(f"{self._url}/getFile", params={"file_id": file_id})
-        r.raise_for_status()
+        try:
+            r = await self._http.get(f"{self._url}/getFile", params={"file_id": file_id})
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            # Маскируем токен в сообщении ошибки
+            raise TelegramError(f"getFile {e.response.status_code}: file_id={file_id[:30]}...") from None
         data = r.json()
         if not data.get("ok"):
             raise TelegramError(f"getFile failed: {data}")
@@ -86,8 +102,11 @@ class TelegramClient:
     async def download_file(self, file_path: str) -> bytes:
         """Скачать содержимое файла по file_path (живёт ~1 час)."""
         url = f"{self._api_base}/file/bot{self._token}/{file_path}"
-        r = await self._http.get(url)
-        r.raise_for_status()
+        try:
+            r = await self._http.get(url)
+            r.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            raise TelegramError(f"downloadFile {e.response.status_code}: path={file_path[:50]}") from None
         return r.content
 
     async def get_file_bytes(self, file_id: str) -> bytes:
