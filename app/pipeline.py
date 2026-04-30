@@ -161,16 +161,21 @@ async def _send_product_results(state: ProductState, chat_id: int, deps: Deps) -
         except Exception as e:
             logger.warning("media_group fail %s: %s", state.sku, e)
 
-    # 2. список ссылок (для копирования)
+    # 2. список ссылок (URL в `backticks` чтобы Markdown не ломал underscore'ы)
     lines = [f"📎 *{state.sku}* — ссылки:"]
     for tag, label in tags_order:
         url = state.images.get(tag)
         if url:
-            lines.append(f"• {label}: {url}")
+            lines.append(f"• {label}: `{url}`")
     try:
         await deps.tg.send(chat_id, "\n".join(lines), parse_mode="Markdown")
     except Exception:
-        pass
+        # Фолбэк без Markdown — просто текст
+        try:
+            plain = "\n".join(f"{l.replace('*','').replace('`','')}" for l in lines)
+            await deps.tg.send(chat_id, plain, parse_mode=None)
+        except Exception:
+            pass
 
     # 3. ZIP-архив со всеми фото
     try:
