@@ -113,13 +113,22 @@ POST /api/run
 1. tg.send "🟦 Запускаю партию"
 2. asyncio.gather(per-product, sem=Semaphore(MAX_PARALLEL_PRODUCTS=3)):
      getFile → S3 src.jpg
-     asyncio.gather(main, pack2, pack3, extra с ref=src) → S3
-     tg.send "🖼 SKU: 4/4"
+     vision-LLM «арт-директор» → JSON-бриф дизайна
+     gen main (ref=src) → S3
+     asyncio.gather(pack2, pack3, extra с ref=main) → S3
+     tg.send media_group + ZIP + ссылки
 3. ozon.category_tree() + wb.subjects_tree()
-4. asyncio.gather: match_category(state) per product   (LLM)
-5. for each unique cat: load_category_data (attrs+values+template)
-6. asyncio.gather: build_skus_and_texts (3 SKU + LLM titles)
+4. asyncio.gather: match_category(state) per product           (LLM)
+5. for each unique (ozon_id, type_id, wb_id): load_category_data
+     (attrs+attribute_values для Ozon, charcs+directory для WB)
+6. asyncio.gather: build_skus_and_texts per state:
+     for each of 3 SKU (qty=1,2,3):
+       LLM #1 → titles (ozon/wb_short/wb_full/annotation/composition)
+       LLM #2 → ozon attribute values  → mapping.map_ozon_attributes
+       LLM #3 → wb characteristic vals → mapping.map_wb_characteristics
 7. asyncio.gather: upload_ozon, upload_wb (return_exceptions=True)
+   — SKU с None в state.attributes_ozon/state.characteristics_wb
+     (required не нашёлся) → сразу в Report.errors, не уходят в API
 8. tg.send build_final_report_md(...)
 ```
 
@@ -133,6 +142,28 @@ POST /api/run
 - 429 Too Many Requests — отдельная обработка с `Retry-After` header
 - Per-SKU ошибки → `state.errors`, не валит партию
 
+### Маппинг атрибутов и характеристик (`app/mapping.py`)
+
+Двухступенчатый процесс «LLM raw → API payload»:
+
+1. **LLM получает компактный список атрибутов категории** + топ-30 значений
+   справочника как `examples` (полный словарь Ozon — до 5000 строк, в LLM
+   не влезет и не нужен). Возвращает `{<id>: "raw value" | ["v1", "v2"]}`.
+2. **Локально по полному словарю** ищем ближайшее значение через Левенштейна
+   (`rules.pick_from_dict`) и собираем payload в формате конкретного API:
+    * Ozon: `{complex_id, id, values: [{dictionary_value_id, value}]}`
+    * WB:   `{id, value: [<v1>, <v2>, ...]}`
+
+Подменённые значения («малиновый» → «Красный») попадают в `state.warnings`
+и финальный отчёт.
+
+### Required-policy
+
+Если хоть один **required** атрибут/характеристика не получили значения
+(LLM не вернул, или Левенштейн не нашёл совпадения в словаре), маппер
+возвращает `(None, warnings)`. SKU исключается из импорта на этап 7 и
+сразу попадает в `Report.errors` с причиной — квота API не тратится.
+
 ## Структура Python-модулей
 
 | Модуль | Роль |
@@ -143,8 +174,9 @@ POST /api/run
 | `tg_handler.py` | state machine + dispatch на pipeline |
 | `kie_ai.py` | `KieAIClient`: createTask + polling + chat_json (с rate-limit handling) |
 | `s3.py` | `S3Client` через aiobotocore (долгоживущий) с per-object public-read |
-| `prompts.py` | сборщики промптов для image и LLM |
-| `rules.py` | бизнес-правила §5.2 ТЗ |
+| `prompts.py` | сборщики промптов для image, LLM-категорий, LLM-атрибутов/характеристик |
+| `rules.py` | бизнес-правила §5.2 ТЗ + Левенштейн-подбор значений |
+| `mapping.py` | LLM-сырые значения → payload Ozon/WB (со словарным мэппингом) |
 | `excel.py` | `OzonTemplate`: openpyxl + Data Validation (включая reference) |
 | `ozon.py` | Ozon Seller API client |
 | `wb.py` | WB Content API client |

@@ -25,9 +25,12 @@ from .models import (
     ReportItem,
     RunRequest,
 )
+from .mapping import map_ozon_attributes, map_wb_characteristics
 from .ozon import OzonClient, OzonError
 from .prompts import (
+    build_attributes_prompts,
     build_category_prompts,
+    build_characteristics_prompts,
     build_design_director_system,
     build_design_director_user,
     build_extra_prompt,
@@ -389,8 +392,12 @@ async def build_skus_and_texts(
         dims_from_internet=True,  # +1 см подстраховка
     )
 
-    # 2. LLM тексты по каждой qty
+    cat_key = (state.ozon_category.id, state.ozon_category.type_id, state.wb_subject.id)
+    cat = cat_data.get(cat_key)
+
+    # 2. LLM тексты + атрибуты + характеристики по каждой qty
     for sku_row in state.skus_3:
+        sku = sku_row["sku"]
         try:
             system, user = build_titles_prompts(
                 state.name,
@@ -400,7 +407,7 @@ async def build_skus_and_texts(
                 sku_row["qty"],
             )
             txt = await deps.kie.chat_json(system=system, user=user)
-            state.titles[sku_row["sku"]] = {
+            state.titles[sku] = {
                 "title_ozon": limit_chars(txt.get("title_ozon", ""), 200),
                 "title_wb_short": limit_chars(strip_brand(txt.get("title_wb_short", ""), state.brand), 60),
                 "title_wb_full": limit_chars(txt.get("title_wb_full", ""), 60),
@@ -408,8 +415,53 @@ async def build_skus_and_texts(
                 "composition_wb": limit_chars(txt.get("composition_wb", ""), 100),
             }
         except Exception as e:
-            state.errors.append(f"titles {sku_row['sku']}: {e}")
-            logger.exception("titles %s err: %s", sku_row["sku"], e)
+            state.errors.append(f"titles {sku}: {e}")
+            logger.exception("titles %s err: %s", sku, e)
+
+        if not cat:
+            continue
+
+        # Ozon атрибуты
+        if cat.ozon_attrs:
+            try:
+                sys_o, usr_o = build_attributes_prompts(
+                    state.name, state.brand, state.ozon_category.path,
+                    sku_row["qty"], cat.ozon_attrs, cat.ozon_attr_values,
+                )
+                llm_o = await deps.kie.chat_json(system=sys_o, user=usr_o)
+                attrs, warns = map_ozon_attributes(
+                    llm_o, cat.ozon_attrs, cat.ozon_attr_values,
+                )
+                state.attributes_ozon[sku] = attrs  # None если required не нашёлся
+                if attrs is None:
+                    state.errors.append(f"ozon attrs {sku}: " + "; ".join(warns))
+                else:
+                    state.warnings.extend(f"{sku}: {w}" for w in warns)
+            except Exception as e:
+                state.errors.append(f"ozon attrs {sku}: {e}")
+                state.attributes_ozon[sku] = None
+                logger.exception("ozon attrs %s err: %s", sku, e)
+
+        # WB характеристики
+        if cat.wb_charcs:
+            try:
+                sys_w, usr_w = build_characteristics_prompts(
+                    state.name, state.brand, state.wb_subject.path,
+                    sku_row["qty"], cat.wb_charcs, cat.wb_charc_values,
+                )
+                llm_w = await deps.kie.chat_json(system=sys_w, user=usr_w)
+                charcs, warns = map_wb_characteristics(
+                    llm_w, cat.wb_charcs, cat.wb_charc_values,
+                )
+                state.characteristics_wb[sku] = charcs
+                if charcs is None:
+                    state.errors.append(f"wb charcs {sku}: " + "; ".join(warns))
+                else:
+                    state.warnings.extend(f"{sku}: {w}" for w in warns)
+            except Exception as e:
+                state.errors.append(f"wb charcs {sku}: {e}")
+                state.characteristics_wb[sku] = None
+                logger.exception("wb charcs %s err: %s", sku, e)
 
 
 # ─── Этап 5: заливка Ozon ───────────────────────────────────────
@@ -425,8 +477,7 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
     # C6 — fallback цепочка: pack → main → src
     hero = pack_url or main or state.src_url
     image_urls = [u for u in (hero, extra) if u]
-    # минимальный набор атрибутов; реальные id зависят от категории
-    attributes: list[dict] = []
+    attributes = state.attributes_ozon.get(sku_row["sku"]) or []
     return {
         "offer_id": sku_row["sku"],
         "name": titles.get("title_ozon", state.name),
@@ -466,6 +517,13 @@ async def upload_ozon(states: list[ProductState], cat_data: dict[tuple, Category
         if not cat:
             continue
         for row in s.skus_3:
+            # ключ есть, значение None → required не нашёлся, SKU исключаем
+            if row["sku"] in s.attributes_ozon and s.attributes_ozon[row["sku"]] is None:
+                rep.errors.append(ReportItem(
+                    sku=row["sku"], mp="ozon",
+                    reason="required attribute missing (см. state.errors)",
+                ))
+                continue
             items.append(_build_ozon_item(s, row, cat))
             sku_to_state[row["sku"]] = s
 
@@ -503,6 +561,7 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
     # C6 fallback
     hero = pack_url or main or state.src_url
     media = [u for u in (hero, extra) if u]
+    characteristics = state.characteristics_wb.get(sku_row["sku"]) or []
     return {
         "subjectID": state.wb_subject.id if state.wb_subject else 0,
         "vendorCode": sku_row["sku"],
@@ -515,7 +574,7 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
             "height": sku_row["dims"].get("h", 0),
             "weightBrutto": sku_row["weight_wb_kg"],
         },
-        "characteristics": [],
+        "characteristics": characteristics,
         "sizes": [{"techSize": "0", "wbSize": "0", "price": 0, "skus": [sku_row["sku"]]}],
         "mediaFiles": media,
     }
@@ -534,6 +593,12 @@ async def upload_wb(states: list[ProductState], cat_data: dict, deps: Deps) -> R
         if not s.skus_3:
             continue
         for row in s.skus_3:
+            if row["sku"] in s.characteristics_wb and s.characteristics_wb[row["sku"]] is None:
+                rep.errors.append(ReportItem(
+                    sku=row["sku"], mp="wb",
+                    reason="required characteristic missing (см. state.errors)",
+                ))
+                continue
             cards.append(_build_wb_card(s, row))
 
     if not cards:

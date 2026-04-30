@@ -491,3 +491,130 @@ def build_titles_prompts(
         f"Количество в наборе (qty): {qty}\n"
     )
     return system, user
+
+
+# ─── атрибуты Ozon / характеристики WB ───────────────────────────
+
+
+def build_attributes_prompts(
+    product_name: str,
+    brand: str | None,
+    category_path: str,
+    qty: int,
+    ozon_attrs: list[dict],
+    ozon_attr_values: dict[int, list[dict]],
+    *,
+    examples_limit: int = 30,
+) -> tuple[str, str]:
+    """LLM-промпт для заполнения значений атрибутов Ozon одной SKU.
+
+    Для атрибутов со словарём подаём топ-N значений как «examples» —
+    LLM выбирает оттуда либо предлагает близкое; локально ищем по
+    Левенштейну в полном словаре (см. mapping.map_ozon_attributes).
+    """
+    system = (
+        "Ты — эксперт по заполнению карточек товара на Ozon. "
+        "По названию товара, бренду, категории и списку атрибутов верни JSON. "
+        "Формат: {\"<id>\": value} для одиночных атрибутов, "
+        "{\"<id>\": [v1, v2, ...]} для is_collection=true. "
+        "Если атрибут required — обязательно дай значение (выбирай из examples; "
+        "если ничего не подходит и тип dictionary — придумай ближайшее по смыслу слово, "
+        "его подберут локально). "
+        "Если атрибут не required и значение неочевидно — пропусти его (не включай в JSON). "
+        "Только JSON, без markdown, без префиксов."
+    )
+
+    spec: list[dict] = []
+    for a in ozon_attrs:
+        aid = a.get("id")
+        if not aid:
+            continue
+        item = {
+            "id": aid,
+            "name": a.get("name") or "",
+            "required": bool(a.get("is_required") or a.get("required")),
+            "is_collection": bool(a.get("is_collection")),
+        }
+        dict_id = a.get("dictionary_id") or 0
+        if dict_id:
+            vals = ozon_attr_values.get(int(aid), [])
+            item["type"] = "dictionary"
+            item["examples"] = [
+                v.get("value") for v in vals[:examples_limit] if v.get("value")
+            ]
+        else:
+            item["type"] = (a.get("type") or "string").lower()
+        spec.append(item)
+
+    user = (
+        f"Товар: {product_name}\n"
+        f"Бренд: {brand or '—'}\n"
+        f"Категория: {category_path}\n"
+        f"Количество в наборе (qty): {qty}\n\n"
+        f"Атрибуты:\n{json.dumps(spec, ensure_ascii=False, indent=2)}\n\n"
+        "Верни строго JSON {\"<attribute_id>\": value | [values]}. "
+        "Ключи — строки с числовыми id. Только JSON."
+    )
+    return system, user
+
+
+def build_characteristics_prompts(
+    product_name: str,
+    brand: str | None,
+    subject_path: str,
+    qty: int,
+    wb_charcs: list[dict],
+    wb_charc_values: dict[int, list[dict]],
+    *,
+    examples_limit: int = 30,
+) -> tuple[str, str]:
+    """LLM-промпт для заполнения характеристик одной карточки WB.
+
+    WB charcType: 0=число, 1=строка, 4=одиночный словарь, 5=мультивыбор.
+    """
+    system = (
+        "Ты — эксперт по заполнению карточек товара на Wildberries. "
+        "По названию товара, бренду, предмету (категории) и списку характеристик "
+        "верни JSON. Формат: {\"<id>\": [value]} — значения ВСЕГДА массив, "
+        "даже если одиночное. Числа отдавай как строки или числа — не критично. "
+        "Если required — обязательно. Если не required и значение неочевидно — пропусти. "
+        "Для типа dictionary выбирай из examples; если ничего не подходит — "
+        "напиши ближайшее по смыслу слово, его подберут локально. "
+        "Только JSON, без markdown."
+    )
+
+    spec: list[dict] = []
+    for c in wb_charcs:
+        cid = c.get("charcID") or c.get("id")
+        if not cid:
+            continue
+        ctype = c.get("charcType")
+        item = {
+            "id": cid,
+            "name": c.get("name") or "",
+            "required": bool(c.get("required") or c.get("isRequired")),
+            "max_count": int(c.get("maxCount") or 0),
+            "type": (
+                "number" if ctype == 0
+                else "string" if ctype == 1
+                else "dictionary_single" if ctype == 4
+                else "dictionary_multi" if ctype == 5
+                else "unknown"
+            ),
+        }
+        if ctype in (4, 5):
+            vals = wb_charc_values.get(int(cid), [])
+            item["examples"] = [
+                v.get("name") for v in vals[:examples_limit] if v.get("name")
+            ]
+        spec.append(item)
+
+    user = (
+        f"Товар: {product_name}\n"
+        f"Бренд: {brand or '—'}\n"
+        f"Предмет (категория): {subject_path}\n"
+        f"Количество в наборе (qty): {qty}\n\n"
+        f"Характеристики:\n{json.dumps(spec, ensure_ascii=False, indent=2)}\n\n"
+        "Верни строго JSON {\"<charcID>\": [value]}. Только JSON."
+    )
+    return system, user

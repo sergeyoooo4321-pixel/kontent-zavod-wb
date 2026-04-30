@@ -69,7 +69,7 @@ curl -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook" \
 ## Тесты
 
 ```bash
-pytest                  # 29 unit-тестов с моками
+pytest                  # 45 unit-тестов с моками
 pytest --integration    # + реальный S3 (нужны env)
 pytest --live           # full e2e (медленно, нужны все ключи)
 ```
@@ -78,10 +78,10 @@ pytest --live           # full e2e (медленно, нужны все ключ
 
 ```
 kontent-zavod-wb/
-├── app/                  # 14 модулей: config, models, telegram, tg_handler,
+├── app/                  # 15 модулей: config, models, telegram, tg_handler,
 │                         #             kie_ai, s3, ozon, wb, excel, prompts,
-│                         #             rules, reports, pipeline, main
-├── tests/                # pytest (29 тестов)
+│                         #             rules, mapping, reports, pipeline, main
+├── tests/                # pytest (45 тестов)
 ├── scripts/              # systemd unit + deploy.sh
 ├── plan/                 # архитектурные документы
 ├── README.md
