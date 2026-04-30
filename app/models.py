@@ -62,6 +62,9 @@ class ProductState(BaseModel):
     # Этап 3
     skus_3: list[dict[str, Any]] = Field(default_factory=list)  # [{sku, qty, ...}]
     titles: dict[str, dict[str, str]] = Field(default_factory=dict)  # per sku_x{1,2,3}
+    # Маппинг атрибутов/характеристик. None как значение = required не нашёлся, SKU исключаем.
+    attributes_ozon: dict[str, list[dict] | None] = Field(default_factory=dict)
+    characteristics_wb: dict[str, list[dict] | None] = Field(default_factory=dict)
 
     # Этап 4
     ozon_status: dict[str, str] = Field(default_factory=dict)
