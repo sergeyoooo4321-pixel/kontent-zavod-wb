@@ -42,8 +42,10 @@ class Settings(BaseSettings):
     WB_BASE: str = "https://content-api.wildberries.ru"
     WB_TOKEN: str | None = None
 
-    # Runtime
-    MAX_PARALLEL_PRODUCTS: int = 3
+    # Runtime — параллельные товары (внутри товара: main → потом 3 параллельно).
+    # Глобальный лимит kie.ai = 8 параллельных запросов (KieAIClient._sem),
+    # так что фактический параллелизм ограничен этим.
+    MAX_PARALLEL_PRODUCTS: int = 10
     HTTP_TIMEOUT_SEC: int = 60
     LLM_TEMPERATURE: float = 0.2
     LOG_LEVEL: str = "INFO"

@@ -156,3 +156,46 @@ class TelegramClient:
             await self.send(chat_id, text, parse_mode=None)
             return
         logger.info("tg.media_group chat_id=%s count=%d", chat_id, len(media))
+
+    @retry(
+        retry=retry_if_exception_type((httpx.NetworkError, httpx.ReadTimeout, httpx.WriteTimeout)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(min=1, max=10),
+        reraise=True,
+    )
+    async def send_document(
+        self,
+        chat_id: int,
+        content: bytes,
+        filename: str,
+        caption: str | None = None,
+        parse_mode: str | None = "Markdown",
+    ) -> dict:
+        """Отправить файл как документ (multipart). Лимит Telegram: 50 МБ.
+
+        Используется для ZIP-архивов с фотками.
+        """
+        files = {"document": (filename, content, "application/zip")}
+        data: dict = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption[:1024]
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+        try:
+            r = await self._http.post(
+                f"{self._url}/sendDocument",
+                data=data, files=files, timeout=120.0,
+            )
+            if r.status_code >= 400 and parse_mode:
+                # Markdown сломался — повторим без него
+                data.pop("parse_mode", None)
+                r = await self._http.post(
+                    f"{self._url}/sendDocument",
+                    data=data, files=files, timeout=120.0,
+                )
+        except httpx.HTTPStatusError as e:
+            raise TelegramError(f"sendDocument {e.response.status_code}") from None
+        if r.status_code >= 400:
+            raise TelegramError(f"sendDocument failed: {r.status_code} {r.text[:200]}")
+        logger.info("tg.send_document chat_id=%s file=%s size=%d", chat_id, filename, len(content))
+        return r.json()

@@ -61,36 +61,58 @@ async def process_product_images(
     deps: Deps,
     sem: asyncio.Semaphore,
 ) -> None:
-    """C5/C6 фикс: узкие except, не теряем sgenerированные картинки, fallback цепочки."""
+    """Sequential within product: src → main → (pack2|pack3|extra parallel with ref=main).
+
+    Pack/extra используют main как input_urls — копируют дизайн один-в-один.
+    """
     async with sem:
-        # 1. скачать из TG → S3
+        # 1. скачать из TG → S3 (src)
         try:
             raw = await deps.tg.get_file_bytes(state.tg_file_id)
             src_key = S3Client.build_key(batch_id, state.sku, "src")
             state.src_url = await deps.s3.put_public(src_key, raw, "image/jpeg")
         except Exception as e:
-            # маскируем токен в репрезентации ошибки (httpx URL может содержать его)
             from .telegram import _mask_token
             msg = _mask_token(str(e))
             state.errors.append(f"src: {msg}")
             logger.error("src upload %s: %s", state.sku, msg)
-            return  # без исходного фото нет смысла продолжать
+            return
 
-        # отдельный try чтобы tg.send-ошибка не валила pipeline
         try:
-            await deps.tg.send(chat_id, f"📥 `{state.sku}`: фото в S3", parse_mode="Markdown")
-        except Exception as e:
-            logger.warning("tg.send src-status %s: %s", state.sku, e)
+            await deps.tg.send(chat_id, f"📥 `{state.sku}`: фото в S3 → генерю main…", parse_mode="Markdown")
+        except Exception:
+            pass
 
-        # 2. main + pack/extra ПАРАЛЛЕЛЬНО с ref=src_url (V3)
-        # main всё равно используется как ref для pack-ов в улучшенной версии,
-        # но для упрощения и скорости — все 4 берут src как референс.
-        async def _gen_one(tag: str, prompt: str) -> tuple[str, str | None, str | None]:
+        # 2. MAIN ПЕРВЫМ — это эталон дизайна (с input_urls=src)
+        try:
+            main_kie_url = await deps.kie.generate_image(
+                prompt=build_main_prompt(state.name, state.brand),
+                input_urls=[state.src_url],
+            )
+            main_bytes = await deps.s3.fetch(main_kie_url)
+            state.images["main"] = await deps.s3.put_public(
+                S3Client.build_key(batch_id, state.sku, "main"), main_bytes
+            )
             try:
-                kie_url = await deps.kie.generate_image(
-                    prompt=prompt,
-                    input_urls=[state.src_url],
+                await deps.tg.send(
+                    chat_id,
+                    f"🎨 `{state.sku}`: main готов, генерю набор 2/3 + доп…",
+                    parse_mode="Markdown",
                 )
+            except Exception:
+                pass
+        except (KieAIError, KieAITimeout, S3Error) as e:
+            state.errors.append(f"main: {e}")
+            logger.exception("main %s: %s", state.sku, e)
+            # без main pack/extra бессмысленны — выходим
+            return
+
+        # 3. pack2/pack3/extra ПАРАЛЛЕЛЬНО, все используют main_url как ref
+        ref_url = state.images["main"]
+
+        async def _gen(tag: str, prompt: str) -> tuple[str, str | None, str | None]:
+            try:
+                kie_url = await deps.kie.generate_image(prompt=prompt, input_urls=[ref_url])
                 content = await deps.s3.fetch(kie_url)
                 public = await deps.s3.put_public(
                     S3Client.build_key(batch_id, state.sku, tag), content
@@ -99,56 +121,89 @@ async def process_product_images(
             except (KieAIError, KieAITimeout, S3Error) as e:
                 return tag, None, str(e)
             except Exception as e:
-                logger.exception("unexpected error in _gen_one %s/%s: %s", state.sku, tag, e)
+                logger.exception("unexpected %s/%s: %s", state.sku, tag, e)
                 return tag, None, f"unexpected: {e}"
 
-        results = await asyncio.gather(
-            _gen_one("main", build_main_prompt(state.name, state.brand)),
-            _gen_one("pack2", build_pack_prompt(state.name, 2)),
-            _gen_one("pack3", build_pack_prompt(state.name, 3)),
-            _gen_one("extra", build_extra_prompt(state.name)),
-            return_exceptions=False,
+        triple = await asyncio.gather(
+            _gen("pack2", build_pack_prompt(state.name, 2)),
+            _gen("pack3", build_pack_prompt(state.name, 3)),
+            _gen("extra", build_extra_prompt(state.name)),
         )
-        for tag, url, err in results:
+        for tag, url, err in triple:
             if url:
                 state.images[tag] = url
             else:
                 state.errors.append(f"{tag}: {err}")
 
-        ok = len(state.images)
-        # Шлём сами фото альбомом (до 4 шт) с подписью
+        # 4. Отдаём пользователю: альбом + ссылки + ZIP
         try:
-            tags_order = [("main", "Главное"), ("pack2", "Набор 2 шт"),
-                          ("pack3", "Набор 3 шт"), ("extra", "Доп. фото")]
-            photos = []
-            for tag, label in tags_order:
-                url = state.images.get(tag)
-                if url:
-                    cap = f"*{state.sku}* — {label}" if not photos else label
-                    photos.append((url, cap if not photos else None))
-            # Первый кортеж — с общей подписью на весь альбом
-            if photos:
-                first_url, _ = photos[0]
-                summary_caption = (
-                    f"🖼 *{state.sku}* — {ok}/4 фото\n"
-                    f"main / pack2 / pack3 / extra"
-                )
-                photos[0] = (first_url, summary_caption)
-                await deps.tg.send_media_group(chat_id, photos)
-            # Плюс текстовое сообщение со ссылками для удобства копирования
-            urls_text_lines = [f"📎 *Ссылки {state.sku}:*"]
-            for tag, label in tags_order:
-                url = state.images.get(tag)
-                if url:
-                    urls_text_lines.append(f"• {label}: {url}")
-            await deps.tg.send(chat_id, "\n".join(urls_text_lines), parse_mode="Markdown")
+            await _send_product_results(state, chat_id, deps)
         except Exception as e:
-            logger.warning("tg.send media %s: %s", state.sku, e)
-            # Фолбэк — короткий статус
+            logger.warning("_send_product_results %s: %s", state.sku, e)
+
+
+async def _send_product_results(state: ProductState, chat_id: int, deps: Deps) -> None:
+    """Отправить юзеру альбом из 4 фото, текстовый список URL и ZIP-архив."""
+    tags_order = [("main", "Главное"), ("pack2", "Набор 2 шт"),
+                  ("pack3", "Набор 3 шт"), ("extra", "Доп. фото")]
+
+    # 1. альбом
+    photos = []
+    for tag, label in tags_order:
+        url = state.images.get(tag)
+        if url:
+            photos.append((url, None))
+    if photos:
+        first_url, _ = photos[0]
+        photos[0] = (first_url, f"🖼 *{state.sku}* — {len(photos)}/4 фото")
+        try:
+            await deps.tg.send_media_group(chat_id, photos)
+        except Exception as e:
+            logger.warning("media_group fail %s: %s", state.sku, e)
+
+    # 2. список ссылок (для копирования)
+    lines = [f"📎 *{state.sku}* — ссылки:"]
+    for tag, label in tags_order:
+        url = state.images.get(tag)
+        if url:
+            lines.append(f"• {label}: {url}")
+    try:
+        await deps.tg.send(chat_id, "\n".join(lines), parse_mode="Markdown")
+    except Exception:
+        pass
+
+    # 3. ZIP-архив со всеми фото
+    try:
+        zip_bytes = await _build_zip(state, deps)
+        if zip_bytes:
+            caption = f"📦 *{state.sku}* — `{state.name}`\n4 фото в архиве"
+            await deps.tg.send_document(
+                chat_id, zip_bytes, f"{state.sku}.zip",
+                caption=caption, parse_mode="Markdown",
+            )
+    except Exception as e:
+        logger.warning("zip send fail %s: %s", state.sku, e)
+
+
+async def _build_zip(state: ProductState, deps: Deps) -> bytes:
+    """Скачать все 4 фото и упаковать в ZIP в памяти."""
+    import io
+    import zipfile
+
+    tags = ["main", "pack2", "pack3", "extra", "src"]
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for tag in tags:
+            url = state.images.get(tag) if tag != "src" else state.src_url
+            if not url:
+                continue
             try:
-                await deps.tg.send(chat_id, f"🖼 `{state.sku}`: {ok}/4 фото", parse_mode="Markdown")
-            except Exception:
-                pass
+                data = await deps.s3.fetch(url)
+                zf.writestr(f"{state.sku}_{tag}.jpg", data)
+            except Exception as e:
+                logger.warning("zip fetch %s/%s: %s", state.sku, tag, e)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ─── Этап 2: категории ───────────────────────────────────────────
