@@ -1,6 +1,6 @@
 # Деплой «Контент завод»
 
-Целевой сервер: **Ubuntu 24.04** + Docker + nginx + n8n (контейнер).
+Целевой сервер: **Ubuntu 24.04** + Python 3.12 + nginx + Let's Encrypt. **Никаких Docker-контейнеров не требуется.**
 
 ## 1. Требования
 
@@ -8,15 +8,14 @@
 |---|---|
 | OS | Ubuntu 24.04+ |
 | Python | 3.12+ |
-| Docker | 28+ (для n8n) |
-| n8n | 2.18+ с env `NODE_FUNCTION_ALLOW_BUILTIN=crypto` (для legacy SUB_WF) |
-| nginx | для TLS перед n8n |
+| nginx | для TLS терминации |
+| certbot | для автоматического Let's Encrypt |
 
 ## 2. Yandex Object Storage
 
-Создать сервисный аккаунт с ролью `storage.editor` на нужный folder. Сгенерировать **HMAC-ключи** (Access Key ID + Secret).
+Создать сервисный аккаунт с ролью `storage.editor` на нужный folder, сгенерировать **HMAC-ключи** (Access Key ID + Secret).
 
-Создать бакет (один раз):
+Создать бакет (один раз, например через `aws s3api`):
 
 ```bash
 aws --endpoint-url=https://storage.yandexcloud.net \
@@ -33,15 +32,15 @@ sudo mkdir -p /home/albert/cz-backend
 sudo chown albert:albert /home/albert/cz-backend
 
 # 2. получить код
-cd /home/albert/cz-backend
-git clone https://github.com/sergeyoooo4321-pixel/kontent-zavod-wb .
+git clone https://github.com/sergeyoooo4321-pixel/kontent-zavod-wb /home/albert/cz-backend
 
 # 3. виртуальное окружение
+cd /home/albert/cz-backend
 python3.12 -m venv .venv
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 
-# 4. .env (никогда не коммитим!)
+# 4. .env (НЕ коммитим!)
 cp .env.example .env
 chmod 0600 .env
 # отредактируй .env: TG_BOT_TOKEN, KIE_API_KEY, S3_*, OZON_*, WB_TOKEN
@@ -56,82 +55,93 @@ curl http://127.0.0.1:8000/healthz
 journalctl -u cz-backend -n 50 -f
 ```
 
-## 4. Доступ из n8n-контейнера к Python
+## 4. nginx
 
-Чтобы из контейнера n8n стучаться на хост-Python (127.0.0.1:8000 на хосте), есть два варианта:
+`/etc/nginx/sites-available/contentzavodprofit.ru`:
 
-### Вариант A: `host.docker.internal` (рекомендуется)
+```nginx
+server {
+    listen 80;
+    server_name contentzavodprofit.ru;
+    return 301 https://$server_name$request_uri;
+}
 
-Контейнер n8n должен быть запущен с флагом `--add-host=host.docker.internal:host-gateway`. Если n8n запущен старым `docker run` без этого флага — пересоздать:
+server {
+    listen 443 ssl;
+    server_name contentzavodprofit.ru;
 
-```bash
-docker stop n8n && docker rm n8n
-docker run -d --name n8n --restart unless-stopped \
-    --add-host=host.docker.internal:host-gateway \
-    -p 127.0.0.1:5678:5678 \
-    -v /home/albert/n8n-docker/n8n_data:/home/node/.n8n \
-    -e N8N_HOST=contentzavodprofit.ru \
-    -e N8N_PORT=5678 \
-    -e N8N_PROTOCOL=https \
-    -e WEBHOOK_URL=https://contentzavodprofit.ru/ \
-    -e N8N_PROXY_HOPS=1 \
-    -e GENERIC_TIMEZONE=Europe/Moscow \
-    -e NODE_FUNCTION_ALLOW_BUILTIN=crypto \
-    -e CZ_BACKEND_URL=http://host.docker.internal:8000 \
-    n8nio/n8n:latest
+    ssl_certificate /etc/letsencrypt/live/contentzavodprofit.ru/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/contentzavodprofit.ru/privkey.pem;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type text/plain;
+    }
+
+    # Telegram webhook → Python
+    location /tg/ {
+        proxy_pass http://127.0.0.1:8000/tg/;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location = /healthz {
+        proxy_pass http://127.0.0.1:8000/healthz;
+    }
+
+    location / {
+        return 200 "Контент завод backend. See /healthz.\n";
+        add_header Content-Type text/plain;
+    }
+}
 ```
 
-Проверка из контейнера:
+Активация:
 ```bash
-docker exec n8n curl -s http://host.docker.internal:8000/healthz
+sudo ln -sf /etc/nginx/sites-available/contentzavodprofit.ru /etc/nginx/sites-enabled/
+sudo nginx -t
+sudo systemctl reload nginx
 ```
 
-### Вариант B: IP моста `docker0`
-
-Узнать IP моста: `ip addr show docker0 | grep inet` — обычно `172.17.0.1`.
+## 5. ufw (firewall)
 
 ```bash
-docker exec n8n curl -s http://172.17.0.1:8000/healthz
+sudo ufw allow 22022/tcp     # SSH
+sudo ufw allow 80/tcp        # HTTP (для certbot)
+sudo ufw allow 443/tcp       # HTTPS
+
+# Бэкенд (порт 8000) — только loopback
+sudo ufw allow from 127.0.0.0/8 to any port 8000 proto tcp
+
+sudo ufw enable
 ```
 
-Использовать как `CZ_BACKEND_URL=http://172.17.0.1:8000`.
-
-## 5. Импорт обновлённого n8n WF
+## 6. Telegram setWebhook
 
 ```bash
-# скопировать workflow JSON в контейнер
-docker cp n8n/wf_main.json n8n:/tmp/wf_main.json
-docker exec n8n n8n import:workflow --input=/tmp/wf_main.json
+curl -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/setWebhook" \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://contentzavodprofit.ru/tg/webhook","drop_pending_updates":true}'
 
-# активировать
-docker exec n8n n8n update:workflow --id=EjcUgpRvj4ZMXXlc --active=true
-
-# деактивировать старые SUB_WF (если ещё активны)
-for id in cz1IntakeImagesA cz2CategoryTplsB cz3FillAndUpldC0; do
-    docker exec n8n n8n update:workflow --id=$id --active=false
-done
-
-# рестарт чтобы n8n перечитал состояние
-docker restart n8n
+# Проверка
+curl "https://api.telegram.org/bot${TG_BOT_TOKEN}/getWebhookInfo"
 ```
 
-## 6. Smoke-тест
+## 7. Smoke-тест
 
-Без Ozon/WB ключей пайплайн дойдёт до этапа категорий и остановится с предупреждением (это ОК на этом этапе).
+Открой `@Content_Zavod_Karusel_bot` в Telegram, нажми `/start`. Должен ответить с приветствием и клавиатурой.
 
-1. Открой `@Content_Zavod_Karusel_bot` в Telegram.
-2. `/start`.
-3. Кидай 1 фото → бот «📷 Фото 1 принято».
-4. «✅ Перейти к названиям» → пиши `Тестовый кофе, TST-001`.
-5. Жми «🚀 Генерация».
-6. n8n шлёт «🚀 Запускаю...».
-7. Python шлёт прогресс: «📥 TST-001: исходное фото в S3», «🖼 TST-001: 4/4 фото готовы».
-8. В S3-бакете появятся `<batch_id>/TST-001_src.jpg`, `_main.jpg`, `_pack2.jpg`, `_pack3.jpg`, `_extra.jpg`.
-9. Бот шлёт «⚠️ Ozon/WB ключи не заданы — пропускаю этапы 2-4».
+Для теста пайплайна без Telegram:
+```bash
+curl -X POST http://127.0.0.1:8000/api/run \
+  -H "Content-Type: application/json" \
+  -d '{"batch_id":"test-001","chat_id":123,"products":[{"idx":0,"sku":"TST-1","name":"Тест","tg_file_id":"AgACAgIAA-FAKE-LONG-FILE-ID"}]}'
+```
 
-Логи: `journalctl -u cz-backend -f`.
-
-## 7. Обновление кода
+## 8. Обновление
 
 ```bash
 cd /home/albert/cz-backend
@@ -141,28 +151,18 @@ sudo systemctl restart cz-backend
 journalctl -u cz-backend -f
 ```
 
-## 8. Откат
-
-Если новая версия не работает:
-
-```bash
-sudo systemctl stop cz-backend
-cd /home/albert/cz-backend && git checkout <previous-tag>
-.venv/bin/pip install -r requirements.txt
-sudo systemctl start cz-backend
-```
-
-В качестве полного отката можно реактивировать SUB_WF_1/2/3 в n8n и переключить активный workflow.
-
 ## 9. Логи и мониторинг
 
-- `journalctl -u cz-backend -f` — Python.
-- `docker logs n8n --tail 200 -f` — n8n.
-- Telegram-бот `@Content_Zavod_Karusel_bot` — пользовательский интерфейс, прогресс, отчёты.
+- Бэкенд: `journalctl -u cz-backend -f`
+- nginx: `sudo tail -f /var/log/nginx/access.log` и `error.log`
+- Telegram-бот: пользовательский интерфейс прогресса/ошибок
 
-## 10. Безопасность
+## 10. Откат
 
-- Все секреты — в `/home/albert/cz-backend/.env` mode 0600 owned by albert.
-- uvicorn bind 127.0.0.1 — наружу не торчит.
-- Опциональный `INTERNAL_TOKEN` для проверки запросов от n8n.
-- nginx терминирует TLS перед n8n; Python внутрь не светит.
+Безопасный откат к предыдущей версии:
+```bash
+cd /home/albert/cz-backend
+git log --oneline -10
+git checkout <previous-commit>
+sudo systemctl restart cz-backend
+```
