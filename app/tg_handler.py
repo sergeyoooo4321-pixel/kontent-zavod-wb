@@ -274,7 +274,7 @@ def _help_text() -> str:
         "    *Профит / Прогресс 24 / Прогресс 247 / ТНП* — конкретный кабинет.\n"
         "    *🔄 Все сразу* — карточка появится во всех кабинетах одним прогоном.\n"
         "3️⃣  Кидаешь фото товаров — *по одному сообщению*. Жми *✅ Готово*.\n"
-        "4️⃣  Для каждого фото пишешь `Название, артикул`.\n"
+        "4️⃣  Для каждого фото пишешь `Артикул, Название`.\n"
         "5️⃣  Подтверждаешь — я генерирую 4 фото на товар + создаю карточки на МП.\n\n"
         "*⚙️ Настройки:*\n"
         "• *DRY\\_RUN* — переключатель заглушки. Когда *вкл* — этап заливки "
@@ -443,7 +443,7 @@ async def _handle_message(msg: dict, deps) -> None:
             s.phase = "names"
             await _send(deps, chat_id,
                 f"✅ Принято *{len(s.photos)}* фото.\n\n"
-                f"Теперь название и артикул для *фото №1*.\nФормат: `Название, артикул`",
+                f"Теперь артикул и название для *фото №1*.\nФормат: `Артикул, Название`",
                 kb=_kb_names())
             return
         if text:
@@ -459,23 +459,23 @@ async def _handle_message(msg: dict, deps) -> None:
                 kb=_kb_names())
             return
         if not text:
-            await _send(deps, chat_id, "Жду название и артикул через запятую.", kb=_kb_names())
+            await _send(deps, chat_id, "Жду артикул и название через запятую.", kb=_kb_names())
             return
         parts = [x.strip() for x in text.replace(";", ",").replace("\t", ",").split(",") if x.strip()]
         if len(parts) < 2:
             await _send(deps, chat_id,
-                "Неверный формат. Должно быть: `Название, артикул`.\n"
-                "Пример: `Кофе Арабика 250г, COF-001`",
+                "Неверный формат. Должно быть: `Артикул, Название`.\n"
+                "Пример: `COF-001, Кофе Арабика 250г`",
                 kb=_kb_names())
             return
-        name = ", ".join(parts[:-1])
-        sku = parts[-1]
+        sku = parts[0]
+        name = ", ".join(parts[1:])
         s.products.append({"name": name, "sku": sku})
         next_idx = len(s.products)
         if next_idx < len(s.photos):
             await _send(deps, chat_id,
-                f"✔️ Фото {next_idx}: {name} `{sku}`\n\n"
-                f"Теперь название+артикул для *фото №{next_idx + 1}*:",
+                f"✔️ Фото {next_idx}: `{sku}` — {name}\n\n"
+                f"Теперь артикул+название для *фото №{next_idx + 1}*:",
                 kb=_kb_names())
             return
         # все названия введены → confirm
@@ -487,7 +487,7 @@ async def _handle_message(msg: dict, deps) -> None:
             f"⚙️ DRY\\_RUN: *{_dry_text()}*", "",
         ]
         for i, p in enumerate(s.products, 1):
-            lines.append(f"{i}) {p['name']} `{p['sku']}`")
+            lines.append(f"{i}) `{p['sku']}` — {p['name']}")
         lines.append("")
         lines.append(f"Всего *{len(s.products)} товаров* × 4 фото = "
                      f"*{len(s.products) * 4}* изображений")
@@ -505,7 +505,7 @@ async def _handle_message(msg: dict, deps) -> None:
             s.phase = "names"
             s.products = []
             await _send(deps, chat_id,
-                "Возвращаемся к названиям. Введи снова `Название, артикул` "
+                "Возвращаемся к названиям. Введи снова `Артикул, Название` "
                 f"для *фото №1* (всего {len(s.photos)}):",
                 kb=_kb_names())
             return
