@@ -28,7 +28,16 @@ from .models import (
     RunRequest,
 )
 from .mapping import map_ozon_attributes, map_wb_characteristics
+from .normalize import (
+    format_ozon_title,
+    format_wb_full_title,
+    format_wb_short_title,
+    ozon_group_name,
+    parse_input_line,
+    wb_group_name,
+)
 from .ozon import OzonClient, OzonError
+from .validation import validate_ozon_item, validate_ozon_item_qty, validate_wb_imt
 from .prompts import (
     build_attributes_prompts,
     build_category_prompts,
@@ -514,27 +523,56 @@ async def build_skus_and_texts(
     cat_key = (state.ozon_category.id, state.ozon_category.type_id, state.wb_subject.id)
     cat = cat_data.get(cat_key)
 
+    # Парсим исходное название один раз — используется для детерминированных форматтеров
+    parsed = parse_input_line(state.name, brand_hint=state.brand)
+    if parsed["brand"] and not state.brand:
+        # Если бренд был извлечён из строки и в ProductState не задан — заполним для дальнейшего использования
+        state.brand = parsed["brand"]
+
     # 2. LLM тексты + атрибуты + характеристики по каждой qty
     for sku_row in state.skus_3:
         sku = sku_row["sku"]
+        qty = sku_row["qty"]
+
+        # Детерминированные титулы из normalize.py (главное имя — без LLM-сюрпризов).
+        # LLM в build_titles_prompts всё ещё используется ДЛЯ описания и состава (annotation_ozon,
+        # composition_wb), но title_* мы пост-обрабатываем правилами регламента.
+        deterministic_title_ozon = format_ozon_title(parsed, qty=qty)
+        deterministic_title_wb_short = format_wb_short_title(parsed)
+        deterministic_title_wb_full = format_wb_full_title(parsed, qty=qty)
+
         try:
             system, user = build_titles_prompts(
                 state.name,
                 state.brand,
                 state.ozon_category.path,
                 state.wb_subject.path,
-                sku_row["qty"],
+                qty,
             )
             txt = await deps.kie.chat_json(system=system, user=user)
+            # Title-поля — детерминированные форматтеры (LLM-варианты как fallback если форматтер пустой)
+            title_ozon = deterministic_title_ozon or limit_chars(txt.get("title_ozon", ""), 500)
+            title_wb_short = deterministic_title_wb_short or limit_chars(
+                strip_brand(txt.get("title_wb_short", ""), state.brand), 60
+            )
+            title_wb_full = deterministic_title_wb_full or limit_chars(txt.get("title_wb_full", ""), 200)
             state.titles[sku] = {
-                "title_ozon": limit_chars(txt.get("title_ozon", ""), 200),
-                "title_wb_short": limit_chars(strip_brand(txt.get("title_wb_short", ""), state.brand), 60),
-                "title_wb_full": limit_chars(txt.get("title_wb_full", ""), 60),
+                "title_ozon": title_ozon,
+                "title_wb_short": title_wb_short,
+                "title_wb_full": title_wb_full,
                 "annotation_ozon": txt.get("annotation_ozon", ""),
                 "composition_wb": limit_chars(txt.get("composition_wb", ""), 100),
             }
         except Exception as e:
-            state.errors.append(f"titles {sku}: {e}")
+            # При фейле LLM — всё равно собираем titles из детерминированных форматтеров
+            state.titles[sku] = {
+                "title_ozon": deterministic_title_ozon,
+                "title_wb_short": deterministic_title_wb_short,
+                "title_wb_full": deterministic_title_wb_full,
+                "annotation_ozon": "",
+                "composition_wb": "",
+            }
+            state.errors.append(f"titles {sku}: {e} (titles взяты из normalize)")
             logger.exception("titles %s err: %s", sku, e)
 
         if not cat:
@@ -586,8 +624,48 @@ async def build_skus_and_texts(
 # ─── Этап 5: заливка Ozon ───────────────────────────────────────
 
 
+def _find_attr_id_by_name(attrs: list[dict], name_substrings: tuple[str, ...]) -> int | None:
+    """Ищет id ozon-атрибута по подстроке в имени (case-insensitive)."""
+    for a in attrs:
+        name = (a.get("name") or "").lower()
+        for sub in name_substrings:
+            if sub.lower() in name:
+                aid = a.get("id")
+                if aid:
+                    return int(aid)
+    return None
+
+
+def _ensure_attr(
+    attributes: list[dict],
+    attr_id: int,
+    value: str,
+    *,
+    complex_id: int = 0,
+    overwrite: bool = False,
+) -> None:
+    """Добавляет (или обновляет) атрибут в Ozon-attributes-массиве."""
+    for a in attributes:
+        if a.get("id") == attr_id:
+            if overwrite:
+                a["values"] = [{"value": str(value)}]
+            return
+    attributes.append({
+        "complex_id": complex_id,
+        "id": attr_id,
+        "values": [{"value": str(value)}],
+    })
+
+
 def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: CategoryData) -> dict:
-    """Собирает один item для POST /v3/product/import по правилам §5.2."""
+    """Собирает один item для POST /v3/product/import по правилам §11 регламента.
+
+    Реализует:
+      • offer_id, name (через format_ozon_title), category_id, type_id, vat=0.22
+      • Габариты + вес упаковки (weight = weight_packed_g по §10.1)
+      • attributes: подмешиваем «Вес товара, г» (одинаковый для qty=1/2/3)
+        и «Группа» = «Бренд - категория» (§11.3) — если такие attr-id есть в категории
+    """
     titles = state.titles.get(sku_row["sku"], {})
     images = state.images
     main = images.get("main") or state.src_url
@@ -596,8 +674,22 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
     # C6 — fallback цепочка: pack → main → src
     hero = pack_url or main or state.src_url
     image_urls = [u for u in (hero, extra) if u]
-    attributes = state.attributes_ozon.get(sku_row["sku"]) or []
-    return {
+    attributes = list(state.attributes_ozon.get(sku_row["sku"]) or [])
+
+    # §11.3 «Группа = Бренд - категория»: если в категории есть атрибут с таким именем — заполним.
+    group_attr_id = _find_attr_id_by_name(cat.ozon_attrs, ("группа товаров", "группа"))
+    if group_attr_id:
+        cat_path = state.ozon_category.path if state.ozon_category else ""
+        _ensure_attr(attributes, group_attr_id, ozon_group_name(state.brand, cat_path))
+
+    # §10.1 «Вес товара, г»: одинаковый для qty=1/2/3 — это вес ОДИНОЧНОЙ единицы.
+    unit_w = sku_row.get("weight_unit_g") or 0
+    if unit_w:
+        unit_attr_id = _find_attr_id_by_name(cat.ozon_attrs, ("вес товара",))
+        if unit_attr_id:
+            _ensure_attr(attributes, unit_attr_id, str(unit_w))
+
+    item = {
         "offer_id": sku_row["sku"],
         "name": titles.get("title_ozon", state.name),
         "category_id": state.ozon_category.id if state.ozon_category else 0,
@@ -605,6 +697,7 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
         "price": "0",
         "old_price": "0",
         "vat": str(nds_value() / 100),  # 0.22
+        # §10.1 «Вес в упаковке, г»: фактический по qty, округлен вверх до 100
         "weight": sku_row["weight_packed_g"],
         "weight_unit": "g",
         "depth": sku_row["dims"].get("l", 0),
@@ -615,6 +708,13 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
         "attributes": attributes,
         "description": titles.get("annotation_ozon", ""),
     }
+    # Pre-flight локальная валидация — кладём warnings в state, не блокируем отправку
+    issues = validate_ozon_item(item) + validate_ozon_item_qty(item, sku_row["qty"])
+    if issues:
+        for issue in issues:
+            state.warnings.append(f"ozon {sku_row['sku']}: {issue}")
+        logger.warning("ozon validation %s: %d issues", sku_row["sku"], len(issues))
+    return item
 
 
 async def _send_dry_run_payload(
@@ -758,16 +858,23 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
         "brand": brand,
         "groupName": group_name,
         "dimensions": {
-            "length": sku_row["dims"].get("l", 0),
-            "width": sku_row["dims"].get("w", 0),
-            "height": sku_row["dims"].get("h", 0),
+            "length": int(sku_row["dims"].get("l", 0) or 0),
+            "width": int(sku_row["dims"].get("w", 0) or 0),
+            "height": int(sku_row["dims"].get("h", 0) or 0),
             "weightBrutto": sku_row["weight_wb_kg"],
         },
         "characteristics": characteristics,
         "sizes": [{"techSize": "0", "wbSize": "0", "price": 0, "skus": [sku_row["sku"]]}],
         "mediaFiles": media,
     }
-    return {"subjectID": subject_id, "variants": [variant]}
+    imt = {"subjectID": subject_id, "variants": [variant]}
+    # Pre-flight локальная валидация WB
+    issues = validate_wb_imt(imt, brand=brand)
+    if issues:
+        for issue in issues:
+            state.warnings.append(f"wb {sku_row['sku']}: {issue}")
+        logger.warning("wb validation %s: %d issues", sku_row["sku"], len(issues))
+    return imt
 
 
 async def upload_wb(
