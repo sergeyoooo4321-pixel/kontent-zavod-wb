@@ -662,12 +662,18 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
     hero = pack_url or main or state.src_url
     media = [u for u in (hero, extra) if u]
     characteristics = state.characteristics_wb.get(sku_row["sku"]) or []
+    # §5.2 ТЗ: WB-группы — внутри одного бренда + одной категории. Разные бренды
+    # в одну группу не объединяются. Формируем groupName как "<brand>_<subjectID>".
+    subject_id = state.wb_subject.id if state.wb_subject else 0
+    brand = (state.brand or "").strip()
+    group_name = f"{brand}_{subject_id}" if brand and subject_id else (brand or f"sub_{subject_id}")
     return {
-        "subjectID": state.wb_subject.id if state.wb_subject else 0,
+        "subjectID": subject_id,
         "vendorCode": sku_row["sku"],
         "title": titles.get("title_wb_short", state.name),
         "description": titles.get("annotation_ozon", ""),
-        "brand": state.brand or "",
+        "brand": brand,
+        "groupName": group_name,
         "dimensions": {
             "length": sku_row["dims"].get("l", 0),
             "width": sku_row["dims"].get("w", 0),
@@ -870,6 +876,23 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
         for s in states:
             for err in s.errors:
                 final.errors.append(ReportItem(sku=s.sku, mp="local", reason=err))
+
+        # §6, §7 ТЗ: персистентный кейс-лог для последующего обучения
+        try:
+            from . import case_log
+            case_log.write_batch_summary(
+                batch_id=req.batch_id,
+                chat_id=req.chat_id,
+                cabinet_names=req.cabinet_names,
+                products=[{"sku": p.sku, "name": p.name} for p in req.products],
+                successes=final.successes,
+                errors=final.errors,
+                warnings=final.warnings,
+            )
+            for s in states:
+                case_log.write_product_state(batch_id=req.batch_id, state=s)
+        except Exception as e:
+            logger.warning("case_log write failed: %s", e)
 
         await deps.tg.send(req.chat_id, build_final_report_md(final), parse_mode="Markdown")
     except Exception as e:
