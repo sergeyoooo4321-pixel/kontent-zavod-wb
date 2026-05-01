@@ -273,7 +273,8 @@ def _help_text() -> str:
         "2️⃣  Если кабинет не выбран — выбираешь на следующем экране.\n"
         "    *Профит / Прогресс 24 / Прогресс 247 / ТНП* — конкретный кабинет.\n"
         "    *🔄 Все сразу* — карточка появится во всех кабинетах одним прогоном.\n"
-        "3️⃣  Кидаешь фото товаров — *по одному сообщению*. Жми *✅ Готово*.\n"
+        "3️⃣  Кидаешь фото товаров — *по одному сообщению*. Можно как обычное фото "
+        "(TG сжимает) или как файл-картинку («Прикрепить → Файл», без сжатия). Жми *✅ Готово*.\n"
         "4️⃣  Для каждого фото пишешь `Артикул, Название`.\n"
         "5️⃣  Подтверждаешь — я генерирую 4 фото на товар + создаю карточки на МП.\n\n"
         "*⚙️ Настройки:*\n"
@@ -307,9 +308,13 @@ async def handle_update(update: dict, deps) -> None:
                     next((k for k in update.keys() if k != "update_id"), "unknown"))
         return
     chat_id = (msg.get("chat") or {}).get("id")
-    has_photo = bool(msg.get("photo"))
+    img_kind = (
+        "photo" if msg.get("photo") else
+        "doc-image" if (msg.get("document") or {}).get("mime_type", "").lower().startswith("image/") else
+        "no"
+    )
     text_preview = (msg.get("text") or "")[:40]
-    logger.info("tg.update msg chat=%s photo=%s text=%r", chat_id, has_photo, text_preview)
+    logger.info("tg.update msg chat=%s image=%s text=%r", chat_id, img_kind, text_preview)
     await _handle_message(msg, deps)
 
 
@@ -330,6 +335,23 @@ async def _handle_legacy_callback(cq: dict, deps) -> None:
         kb=_kb_main(s))
 
 
+def _extract_image_file_id(msg: dict) -> str | None:
+    """Возвращает file_id картинки из message.
+
+    Поддерживает два варианта отправки:
+      • message.photo — обычное фото (TG сжимает) → берём самый большой size
+      • message.document — файл (без сжатия) с mime_type='image/*' → берём как есть
+    """
+    photos = msg.get("photo") or []
+    if photos:
+        return photos[-1].get("file_id")
+    doc = msg.get("document") or {}
+    mime = (doc.get("mime_type") or "").lower()
+    if mime.startswith("image/"):
+        return doc.get("file_id")
+    return None
+
+
 async def _handle_message(msg: dict, deps) -> None:
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
@@ -337,7 +359,8 @@ async def _handle_message(msg: dict, deps) -> None:
         return
 
     text = (msg.get("text") or "").strip()
-    photos = msg.get("photo") or []
+    image_file_id = _extract_image_file_id(msg)
+    has_image = image_file_id is not None
     s = _get_session(chat_id)
 
     # ── глобальные команды ───────────────────────────────
@@ -375,6 +398,8 @@ async def _handle_message(msg: dict, deps) -> None:
             await _send(deps, chat_id,
                 f"📦 *Новая партия* → кабинет *{cab}*\n\n"
                 "Кидай фото товаров *по одному сообщению*.\n"
+                "Можно как обычное фото (TG сжимает) или как файл-картинку "
+                "(`Прикрепить → Файл`) — без сжатия, лучше для качества.\n\n"
                 "Когда все — жми «✅ Готово, к названиям».",
                 kb=_kb_photos())
             return
@@ -423,9 +448,8 @@ async def _handle_message(msg: dict, deps) -> None:
         return
 
     if s.phase == "photos":
-        if photos:
-            biggest = photos[-1]
-            s.photos.append({"file_id": biggest["file_id"], "idx": len(s.photos)})
+        if has_image:
+            s.photos.append({"file_id": image_file_id, "idx": len(s.photos)})
             await _send(deps, chat_id,
                 f"📷 Фото *{len(s.photos)}* принято. "
                 "Пришли следующее или жми «✅ Готово».",
@@ -448,12 +472,13 @@ async def _handle_message(msg: dict, deps) -> None:
             return
         if text:
             await _send(deps, chat_id,
-                "Сейчас фаза приёма фото. Пришли фотографию или жми «✅ Готово».",
+                "Сейчас фаза приёма фото. Пришли фотографию (как фото или как файл-картинку) "
+                "или жми «✅ Готово».",
                 kb=_kb_photos())
         return
 
     if s.phase == "names":
-        if photos:
+        if has_image:
             await _send(deps, chat_id,
                 "Сейчас фаза приёма названий. Фото добавлять нельзя.",
                 kb=_kb_names())
