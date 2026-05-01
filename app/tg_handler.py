@@ -1,22 +1,16 @@
-"""Telegram update handler с inline-меню и multi-cabinet UX.
+"""Telegram update handler с reply-клавиатурой и multi-cabinet UX.
 
-Главное меню (`/start` → одно inline-сообщение, которое редактируется):
-  🏪 Кабинет: Профит ▾
-  📦 Новая партия товаров
-  ⚙️ Настройки (DRY_RUN: вкл)
-  ℹ️ Помощь
+Вся навигация — через reply-keyboard (кнопки внизу экрана, всегда видны).
+В каждом подменю есть «◀️ Назад» — возврат в главное меню (или на предыдущий шаг).
 
-Callback flow:
-  menu:main         — вернуться в главное меню
-  cab:<name>        — выбрать кабинет (профит/прогресс24/...)
-  cab:all           — mirror-режим (все кабинеты)
-  flow:start        — старт новой партии (выбор кабинета → photos)
-  flow:run          — запустить генерацию (после загрузки фото и названий)
-  flow:cancel       — отменить и вернуться в главное меню
-  mode:dry_on/off   — переключить DRY_RUN
-  help              — показать справку
-
-Состояния партии: idle → photos → names → confirm → running.
+Состояния (TgSession.phase):
+  idle              — главное меню
+  cabinet_select    — выбор кабинета (Профит / Прогресс 24 / 247 / ТНП / mirror)
+  settings          — настройки (DRY_RUN toggle, текущий кабинет)
+  photos            — приём фото
+  names             — приём названий+артикулов
+  confirm           — подтверждение запуска
+  running           — пайплайн идёт
 """
 from __future__ import annotations
 
@@ -27,7 +21,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import CABINET_LABELS, settings
+from .config import settings
 from .models import ProductIn, RunRequest
 
 logger = logging.getLogger(__name__)
@@ -45,7 +39,6 @@ class TgSession:
 
     # multi-cabinet UX:
     cabinet: str | None = None  # "profit"|"progress24"|"progress247"|"tnp"|"default"|"all"
-    menu_message_id: int | None = None  # сообщение главного меню (для edit)
 
 
 _sessions: dict[int, TgSession] = {}
@@ -59,15 +52,36 @@ def _get_session(chat_id: int) -> TgSession:
     return s
 
 
-def _reset_session(chat_id: int, keep_cabinet: bool = True) -> TgSession:
-    """Сбрасывает партию, сохраняя выбранный кабинет."""
-    cab = _sessions.get(chat_id).cabinet if (_sessions.get(chat_id) and keep_cabinet) else None
+def _reset_partial(chat_id: int) -> TgSession:
+    """Сбрасывает партию (фото/названия), сохраняя cabinet."""
+    cab = _sessions.get(chat_id).cabinet if _sessions.get(chat_id) else None
     s = TgSession(cabinet=cab)
     _sessions[chat_id] = s
     return s
 
 
-# ─── helpers для текстов и кнопок ─────────────────────────────────
+# ─── метки для UI ────────────────────────────────────────────────
+
+
+# Канон названий кнопок — собраны в одном месте чтобы не разъезжалось
+BTN_NEW_BATCH = "📦 Новая партия"
+BTN_CABINET_PREFIX = "🏪 Кабинет:"  # динамический суффикс
+BTN_SETTINGS = "⚙️ Настройки"
+BTN_HELP = "ℹ️ Помощь"
+BTN_BACK = "◀️ Назад в меню"
+BTN_PHOTOS_DONE = "✅ Готово, к названиям"
+BTN_RESET = "🔄 Сбросить партию"
+BTN_RUN = "▶️ Запустить генерацию"
+BTN_CONFIRM_BACK = "◀️ Назад к названиям"
+BTN_CABINET_ALL = "🔄 Все сразу (mirror)"
+
+CABINET_DETAILS = {
+    "profit": "Профит",
+    "progress24": "Прогресс 24",
+    "progress247": "Прогресс 247",
+    "tnp": "ТНП",
+    "default": "Default",
+}
 
 
 def _cabinet_label(name: str | None) -> str:
@@ -75,106 +89,114 @@ def _cabinet_label(name: str | None) -> str:
         return "🔄 Все сразу"
     if not name:
         return "не выбран"
-    return CABINET_LABELS.get(name, name)
+    return CABINET_DETAILS.get(name, name)
 
 
-def _main_menu_text(s: TgSession) -> str:
-    cab = _cabinet_label(s.cabinet)
-    dry = "✅ вкл" if settings.DRY_RUN else "❌ выкл"
-    return (
-        "🏭 *Контент-завод*\n\n"
-        f"🏪 Кабинет: *{cab}*\n"
-        f"⚙️ DRY\\_RUN: {dry}\n\n"
-        "_DRY\\_RUN — заглушка от заливки. Когда вкл — карточки на МП НЕ публикуются, "
-        "а в чат приходит JSON с тем что бы ушло._"
-    )
+def _cabinet_button_label(c) -> str:
+    """Кнопка для одного кабинета: «Профит ✓О+В» / «Прогресс 247 ✓В»."""
+    marks = []
+    if c.has_ozon:
+        marks.append("О")
+    if c.has_wb:
+        marks.append("В")
+    suffix = f" ✓{'+'.join(marks)}" if marks else " (нет токенов)"
+    return f"{c.label}{suffix}"
 
 
-def _main_menu_buttons(s: TgSession) -> list[list[dict]]:
-    cab = _cabinet_label(s.cabinet)
-    dry = "✅ вкл" if settings.DRY_RUN else "❌ выкл"
-    return [
-        [{"text": f"🏪 Кабинет: {cab}", "callback_data": "menu:cabinets"}],
-        [{"text": "📦 Новая партия товаров", "callback_data": "flow:start"}],
-        [{"text": f"⚙️ DRY_RUN: {dry}", "callback_data": "mode:dry_toggle"}],
-        [{"text": "ℹ️ Помощь", "callback_data": "help"}],
-    ]
+def _btn_cabinet_top(s: TgSession) -> str:
+    return f"{BTN_CABINET_PREFIX} {_cabinet_label(s.cabinet)}"
 
 
-def _cabinet_menu_buttons() -> list[list[dict]]:
-    """Список доступных кабинетов из settings + Mirror-кнопка."""
-    rows: list[list[dict]] = []
+# ─── reply-клавиатуры по фазам ────────────────────────────────────
+
+
+def _kb(rows: list[list[str]]) -> dict:
+    return {
+        "keyboard": [[{"text": t} for t in row] for row in rows],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
+
+def _kb_main(s: TgSession) -> dict:
+    return _kb([
+        [BTN_NEW_BATCH],
+        [_btn_cabinet_top(s)],
+        [BTN_SETTINGS, BTN_HELP],
+    ])
+
+
+def _kb_cabinets() -> dict:
+    rows: list[list[str]] = []
     cabs = settings.list_cabinets()
-    # По 2 кабинета в ряду
-    pair: list[dict] = []
+    pair: list[str] = []
     for c in cabs:
-        marks = []
-        if c.has_ozon:
-            marks.append("О")
-        if c.has_wb:
-            marks.append("В")
-        suffix = f" ({'+'.join(marks)})" if marks else ""
-        pair.append({"text": f"{c.label}{suffix}", "callback_data": f"cab:{c.name}"})
+        pair.append(_cabinet_button_label(c))
         if len(pair) == 2:
             rows.append(pair)
             pair = []
     if pair:
         rows.append(pair)
     if cabs:
-        rows.append([{"text": "🔄 Все сразу (mirror)", "callback_data": "cab:all"}])
-    rows.append([{"text": "← Назад", "callback_data": "menu:main"}])
-    return rows
+        rows.append([BTN_CABINET_ALL])
+    rows.append([BTN_BACK])
+    return _kb(rows)
 
 
-def _help_text() -> str:
-    return (
-        "*Как пользоваться:*\n\n"
-        "1. Жмёшь *📦 Новая партия*\n"
-        "2. Если кабинет ещё не выбран — выбираешь (Профит / Прогресс 24 / ТНП / Прогресс 247 / 🔄 Все сразу)\n"
-        "3. Кидаешь фото товаров — *по одному сообщению*\n"
-        "4. Жмёшь *✅ Готово*\n"
-        "5. Для каждого фото пишешь `Название, артикул`\n"
-        "6. Подтверждаешь и я генерирую 4 фото на товар + создаю карточки на МП\n\n"
-        "*Кабинеты:* О = Ozon настроен, В = WB настроен.\n"
-        "*Mirror:* «🔄 Все сразу» — карточка появится во всех кабинетах одним прогоном.\n"
-        "*DRY\\_RUN вкл:* всё проходит до Этапа 5, но в МП ничего не отправляется — "
-        "получаешь JSON-payload в чат для проверки.\n\n"
-        "Команды: `/reset` `/start`"
-    )
-
-
-# ─── reply-клавиатуры (для приёма фото и названий, более привычно) ─
+def _kb_settings() -> dict:
+    dry_btn = ("⚙️ DRY_RUN: ✅ вкл (нажми чтобы выключить)"
+               if settings.DRY_RUN
+               else "⚙️ DRY_RUN: ❌ выкл (нажми чтобы ВКЛ-чить)")
+    return _kb([
+        [dry_btn],
+        [BTN_BACK],
+    ])
 
 
 def _kb_photos() -> dict:
-    return {
-        "keyboard": [
-            [{"text": "✅ Готово, к названиям"}],
-            [{"text": "❌ Отмена"}],
-        ],
-        "resize_keyboard": True, "is_persistent": True,
-    }
+    return _kb([
+        [BTN_PHOTOS_DONE],
+        [BTN_RESET],
+        [BTN_BACK],
+    ])
 
 
 def _kb_names() -> dict:
-    return {
-        "keyboard": [[{"text": "❌ Отмена"}]],
-        "resize_keyboard": True, "is_persistent": True,
-    }
+    return _kb([
+        [BTN_RESET],
+        [BTN_BACK],
+    ])
 
 
-def _kb_remove() -> dict:
-    """Скрыть reply-клавиатуру, оставить inline-меню."""
-    return {"remove_keyboard": True}
+def _kb_confirm() -> dict:
+    return _kb([
+        [BTN_RUN],
+        [BTN_CONFIRM_BACK],
+        [BTN_RESET],
+    ])
 
 
-# ─── send / edit helpers ──────────────────────────────────────────
+def _kb_running() -> dict:
+    return _kb([
+        [BTN_BACK],
+    ])
+
+
+# ─── helpers ──────────────────────────────────────────────────────
+
+
+def _settings_dry_btn_match(text: str) -> bool:
+    """Любой вариант DRY_RUN-кнопки (вкл/выкл) — это toggle."""
+    return text.startswith("⚙️ DRY_RUN:")
+
+
+def _dry_text() -> str:
+    return "✅ вкл" if settings.DRY_RUN else "❌ выкл"
 
 
 async def _send(deps, chat_id: int, text: str, kb: dict | None = None,
-                parse_mode: str | None = "Markdown") -> dict | None:
-    """Простая отправка через TelegramClient.send, опционально reply-клавиатура."""
-    import httpx
+                parse_mode: str | None = "Markdown") -> None:
+    """Send text + optional reply-keyboard. Markdown с фолбэком в plain."""
     body: dict = {
         "chat_id": chat_id,
         "text": text[:4090],
@@ -192,153 +214,87 @@ async def _send(deps, chat_id: int, text: str, kb: dict | None = None,
             r = await deps.tg._http.post(url, json=body, timeout=15)
         if r.status_code >= 400:
             logger.warning("tg send fail %s: %s", r.status_code, r.text[:200])
-            return None
-        return r.json().get("result")
     except Exception as e:
         logger.warning("tg send fail: %s", e)
-        return None
 
 
-async def _send_main_menu(deps, chat_id: int, s: TgSession) -> None:
-    """Отправляет (или редактирует, если есть menu_message_id) главное меню."""
-    text = _main_menu_text(s)
-    buttons = _main_menu_buttons(s)
-    if s.menu_message_id:
-        ok = await deps.tg.edit_message_text(chat_id, s.menu_message_id, text, buttons=buttons)
-        if ok:
-            return
-        # сообщение нельзя редактировать (>48ч / удалили) — отправим новое
-    res = await deps.tg.send_with_buttons(chat_id, text, buttons)
-    if res and res.get("message_id"):
-        s.menu_message_id = res["message_id"]
+# ─── экраны ───────────────────────────────────────────────────────
 
 
-# ─── главный обработчик update ─────────────────────────────────────
+def _main_menu_text(s: TgSession) -> str:
+    cab = _cabinet_label(s.cabinet)
+    return (
+        "🏭 *Контент-завод*\n\n"
+        f"🏪 Кабинет: *{cab}*\n"
+        f"⚙️ DRY\\_RUN: *{_dry_text()}*\n\n"
+        "_DRY\\_RUN — заглушка. Когда вкл — карточки на МП НЕ публикуются, "
+        "а в чат приходит JSON с тем что бы ушло._"
+    )
+
+
+async def _show_main_menu(deps, chat_id: int, s: TgSession) -> None:
+    await _send(deps, chat_id, _main_menu_text(s), kb=_kb_main(s))
+
+
+async def _show_cabinet_menu(deps, chat_id: int) -> None:
+    cabs = settings.list_cabinets()
+    if not cabs:
+        await _send(deps, chat_id,
+            "⚠️ *Кабинеты не настроены.*\n\nДобавь токены в `.env`: "
+            "`OZON_PROFIT_CLIENT_ID/OZON_PROFIT_API_KEY`, `WB_PROFIT_TOKEN`, и т.п.",
+            kb=_kb_main(_get_session(chat_id)))
+        return
+    lines = [
+        "🏪 *Выбери кабинет.*",
+        "",
+        "✓О = Ozon настроен, ✓В = WB настроен",
+        "*🔄 Все сразу* — карточка во всех кабинетах одним прогоном (mirror)",
+    ]
+    await _send(deps, chat_id, "\n".join(lines), kb=_kb_cabinets())
+
+
+async def _show_settings(deps, chat_id: int, s: TgSession) -> None:
+    cab = _cabinet_label(s.cabinet)
+    text = (
+        "⚙️ *Настройки*\n\n"
+        f"🏪 Текущий кабинет: *{cab}*\n"
+        f"⚙️ DRY\\_RUN: *{_dry_text()}*\n\n"
+        "_При DRY\\_RUN=вкл этап заливки на МП собирает payload и шлёт сюда "
+        "JSON-документом — карточки в кабинетах НЕ создаются. Когда выключишь — "
+        "карточки реально создадутся через API._"
+    )
+    await _send(deps, chat_id, text, kb=_kb_settings())
+
+
+def _help_text() -> str:
+    return (
+        "*Как пользоваться:*\n\n"
+        "1️⃣  Жми *📦 Новая партия*.\n"
+        "2️⃣  Если кабинет не выбран — выбираешь на следующем экране.\n"
+        "    *Профит / Прогресс 24 / Прогресс 247 / ТНП* — конкретный кабинет.\n"
+        "    *🔄 Все сразу* — карточка появится во всех кабинетах одним прогоном.\n"
+        "3️⃣  Кидаешь фото товаров — *по одному сообщению*. Жми *✅ Готово*.\n"
+        "4️⃣  Для каждого фото пишешь `Название, артикул`.\n"
+        "5️⃣  Подтверждаешь — я генерирую 4 фото на товар + создаю карточки на МП.\n\n"
+        "*⚙️ Настройки:*\n"
+        "• *DRY\\_RUN* — переключатель заглушки. Когда *вкл* — этап заливки "
+        "на маркетплейсы НЕ выполняется, payload приходит в чат как JSON. "
+        "Безопасно тестить без публикации товаров.\n\n"
+        "*◀️ Назад в меню* — возвращает в главное меню в любой момент.\n"
+        "*🔄 Сбросить партию* — чистит все фото и названия (кабинет сохраняется).\n\n"
+        "Команды: `/start` `/help`"
+    )
+
+
+# ─── главный обработчик update ────────────────────────────────────
 
 
 async def handle_update(update: dict, deps) -> None:
-    """Главный обработчик. Различает message и callback_query."""
-    if "callback_query" in update:
-        await _handle_callback(update["callback_query"], deps)
-        return
-    if "message" in update:
-        await _handle_message(update["message"], deps)
-        return
-
-
-# ─── callback_query handler ───────────────────────────────────────
-
-
-async def _handle_callback(cq: dict, deps) -> None:
-    cq_id = cq.get("id") or ""
-    data = cq.get("data") or ""
-    msg = cq.get("message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    msg_id = msg.get("message_id")
-    if not chat_id or not data:
-        await deps.tg.answer_callback_query(cq_id)
-        return
-
-    s = _get_session(chat_id)
-    s.menu_message_id = msg_id  # запоминаем для последующего edit
-
-    # Закрываем «крутилку» сразу же
-    await deps.tg.answer_callback_query(cq_id)
-
-    if data == "menu:main":
-        await _send_main_menu(deps, chat_id, s)
-        return
-
-    if data == "menu:cabinets":
-        cabs = settings.list_cabinets()
-        if not cabs:
-            text = ("⚠️ *Кабинеты не настроены.*\n\nДобавь токены Ozon/WB в `.env` "
-                    "(`OZON_PROFIT_CLIENT_ID/OZON_PROFIT_API_KEY`, `WB_PROFIT_TOKEN`, и т.д.).")
-            await deps.tg.edit_message_text(chat_id, msg_id, text,
-                                             buttons=[[{"text": "← Назад", "callback_data": "menu:main"}]])
-            return
-        text = (
-            "🏪 *Выбери кабинет.*\n\n"
-            "О = Ozon настроен, В = WB настроен.\n"
-            "*🔄 Все сразу* — карточка появится во всех кабинетах одним прогоном."
-        )
-        await deps.tg.edit_message_text(chat_id, msg_id, text, buttons=_cabinet_menu_buttons())
-        return
-
-    if data.startswith("cab:"):
-        cab_name = data.split(":", 1)[1]
-        if cab_name == "all":
-            s.cabinet = "all"
-        else:
-            cab = settings.get_cabinet(cab_name)
-            if not cab:
-                await deps.tg.answer_callback_query(cq_id, "Кабинет не найден", show_alert=True)
-                return
-            s.cabinet = cab_name
-        await _send_main_menu(deps, chat_id, s)
-        return
-
-    if data == "mode:dry_toggle":
-        settings.DRY_RUN = not settings.DRY_RUN
-        logger.info("DRY_RUN toggled to %s by chat=%s", settings.DRY_RUN, chat_id)
-        await _send_main_menu(deps, chat_id, s)
-        return
-
-    if data == "help":
-        await deps.tg.edit_message_text(
-            chat_id, msg_id, _help_text(),
-            buttons=[[{"text": "← Назад", "callback_data": "menu:main"}]],
-        )
-        return
-
-    if data == "flow:start":
-        if not s.cabinet:
-            # сначала кабинет
-            cabs = settings.list_cabinets()
-            if not cabs:
-                await deps.tg.answer_callback_query(cq_id, "Сначала настрой кабинеты в .env", show_alert=True)
-                return
-            text = (
-                "🏪 *Выбери кабинет для партии.*\n\n"
-                "О = Ozon, В = WB.\n*🔄 Все сразу* — во все настроенные кабинеты."
-            )
-            await deps.tg.edit_message_text(chat_id, msg_id, text, buttons=_cabinet_menu_buttons())
-            return
-        # перейти в фазу photos
-        s.phase = "photos"
-        s.photos = []
-        s.products = []
-        s.started_at = time.time()
-        cab = _cabinet_label(s.cabinet)
-        await deps.tg.edit_message_text(
-            chat_id, msg_id,
-            f"📦 *Новая партия* → кабинет *{cab}*\n\n"
-            "Кидай фото товаров *по одному сообщению*.\nКогда все — жми «✅ Готово, к названиям».",
-            buttons=[[{"text": "✖ Отмена", "callback_data": "flow:cancel"}]],
-        )
-        # reply-клавиатура поверх (для удобной кнопки «Готово»)
-        await _send(deps, chat_id, "Жду фото 📷", kb=_kb_photos())
-        return
-
-    if data == "flow:cancel":
-        _reset_session(chat_id, keep_cabinet=True)
-        s = _get_session(chat_id)
-        s.menu_message_id = msg_id
-        await _send(deps, chat_id, "❌ Партия отменена.", kb=_kb_remove())
-        await _send_main_menu(deps, chat_id, s)
-        return
-
-    if data == "flow:run":
-        # подтверждение — запускаем pipeline
-        if s.phase != "confirm":
-            await deps.tg.answer_callback_query(cq_id, "Нечего запускать", show_alert=True)
-            return
-        await _start_pipeline(chat_id, deps, s)
-        return
-
-
-# ─── message handler (фото / текст) ───────────────────────────────
+    """Вся навигация через reply-кнопки → текстовые сообщения."""
+    msg = update.get("message")
+    if not msg:
+        return  # callback_query больше не используем
+    await _handle_message(msg, deps)
 
 
 async def _handle_message(msg: dict, deps) -> None:
@@ -351,30 +307,86 @@ async def _handle_message(msg: dict, deps) -> None:
     photos = msg.get("photo") or []
     s = _get_session(chat_id)
 
-    # ── universal commands ───────────────────────────────
-    if text in ("/reset", "🔄 Сбросить", "❌ Отмена"):
-        _reset_session(chat_id, keep_cabinet=True)
-        s = _get_session(chat_id)
-        await _send(deps, chat_id, "🧹 Сессия сброшена.", kb=_kb_remove())
-        await _send_main_menu(deps, chat_id, s)
+    # ── глобальные команды ───────────────────────────────
+    if text in ("/start", "/menu"):
+        s.phase = "idle"
+        await _show_main_menu(deps, chat_id, s)
+        return
+    if text in ("/help", BTN_HELP):
+        await _send(deps, chat_id, _help_text(), kb=_kb_main(s))
+        return
+    if text in ("/reset", BTN_RESET):
+        s = _reset_partial(chat_id)
+        await _send(deps, chat_id, "🧹 Партия сброшена. Кабинет сохранён.", kb=_kb_main(s))
         return
 
-    if text in ("/start",):
-        # Полный сброс ID сообщения меню чтобы старое не мешало
-        s.menu_message_id = None
-        await _send(deps, chat_id, "Загружаю меню…", kb=_kb_remove())
-        await _send_main_menu(deps, chat_id, s)
+    # ── кнопка «Назад в меню» работает на любой фазе ─────
+    if text == BTN_BACK:
+        s.phase = "idle"
+        await _show_main_menu(deps, chat_id, s)
         return
 
-    if text in ("/help", "ℹ️ Помощь"):
-        await _send(deps, chat_id, _help_text())
-        return
-
-    # ── state machine ────────────────────────────────────
+    # ── маршруты по фазам ────────────────────────────────
 
     if s.phase == "idle":
-        # любое сообщение в idle — показать меню
-        await _send_main_menu(deps, chat_id, s)
+        if text == BTN_NEW_BATCH:
+            if not s.cabinet:
+                s.phase = "cabinet_select"
+                await _show_cabinet_menu(deps, chat_id)
+                return
+            s.phase = "photos"
+            s.photos = []
+            s.products = []
+            s.started_at = time.time()
+            cab = _cabinet_label(s.cabinet)
+            await _send(deps, chat_id,
+                f"📦 *Новая партия* → кабинет *{cab}*\n\n"
+                "Кидай фото товаров *по одному сообщению*.\n"
+                "Когда все — жми «✅ Готово, к названиям».",
+                kb=_kb_photos())
+            return
+        if text.startswith(BTN_CABINET_PREFIX):
+            s.phase = "cabinet_select"
+            await _show_cabinet_menu(deps, chat_id)
+            return
+        if text == BTN_SETTINGS:
+            s.phase = "settings"
+            await _show_settings(deps, chat_id, s)
+            return
+        # любое другое — показать меню
+        await _show_main_menu(deps, chat_id, s)
+        return
+
+    if s.phase == "cabinet_select":
+        if text == BTN_CABINET_ALL:
+            s.cabinet = "all"
+            s.phase = "idle"
+            await _send(deps, chat_id,
+                "🔄 Выбран *mirror-режим* — следующая партия зальётся "
+                "во ВСЕ настроенные кабинеты одним прогоном.",
+                kb=_kb_main(s))
+            return
+        # сравним по началу строки (точные label кабинетов в кнопках)
+        for c in settings.list_cabinets():
+            if text.startswith(c.label):
+                s.cabinet = c.name
+                s.phase = "idle"
+                await _send(deps, chat_id,
+                    f"✅ Кабинет: *{c.label}*",
+                    kb=_kb_main(s))
+                return
+        # не распознали — повторим
+        await _show_cabinet_menu(deps, chat_id)
+        return
+
+    if s.phase == "settings":
+        if _settings_dry_btn_match(text):
+            settings.DRY_RUN = not settings.DRY_RUN
+            logger.info("DRY_RUN toggled to %s by chat=%s", settings.DRY_RUN, chat_id)
+            await _show_settings(deps, chat_id, s)
+            return
+        # не распознали — повторим
+        await _show_settings(deps, chat_id, s)
         return
 
     if s.phase == "photos":
@@ -382,16 +394,18 @@ async def _handle_message(msg: dict, deps) -> None:
             biggest = photos[-1]
             s.photos.append({"file_id": biggest["file_id"], "idx": len(s.photos)})
             await _send(deps, chat_id,
-                f"📷 Фото *{len(s.photos)}* принято. Пришли следующее или жми «✅ Готово, к названиям».",
+                f"📷 Фото *{len(s.photos)}* принято. "
+                "Пришли следующее или жми «✅ Готово».",
                 kb=_kb_photos())
             return
-        if text in ("✅ Готово, к названиям", "✅ Готово", "/next"):
+        if text == BTN_PHOTOS_DONE:
             if not s.photos:
                 await _send(deps, chat_id, "Сначала пришли хотя бы одно фото.", kb=_kb_photos())
                 return
             if len(s.photos) > 10:
-                await _send(deps, chat_id, f"Максимум 10 товаров. У тебя {len(s.photos)}. Жми /reset.",
-                            kb=_kb_photos())
+                await _send(deps, chat_id,
+                    f"Максимум 10 товаров. У тебя {len(s.photos)}. Жми «🔄 Сбросить партию».",
+                    kb=_kb_photos())
                 return
             s.phase = "names"
             await _send(deps, chat_id,
@@ -400,14 +414,16 @@ async def _handle_message(msg: dict, deps) -> None:
                 kb=_kb_names())
             return
         if text:
-            await _send(deps, chat_id, "Сейчас фаза приёма фото. Пришли фото или жми «✅ Готово».",
-                        kb=_kb_photos())
+            await _send(deps, chat_id,
+                "Сейчас фаза приёма фото. Пришли фотографию или жми «✅ Готово».",
+                kb=_kb_photos())
         return
 
     if s.phase == "names":
         if photos:
-            await _send(deps, chat_id, "Сейчас фаза приёма названий. Фото добавлять нельзя.",
-                        kb=_kb_names())
+            await _send(deps, chat_id,
+                "Сейчас фаза приёма названий. Фото добавлять нельзя.",
+                kb=_kb_names())
             return
         if not text:
             await _send(deps, chat_id, "Жду название и артикул через запятую.", kb=_kb_names())
@@ -415,7 +431,8 @@ async def _handle_message(msg: dict, deps) -> None:
         parts = [x.strip() for x in text.replace(";", ",").replace("\t", ",").split(",") if x.strip()]
         if len(parts) < 2:
             await _send(deps, chat_id,
-                "Неверный формат. Должно быть: `Название, артикул`.\nПример: `Кофе Арабика 250г, COF-001`",
+                "Неверный формат. Должно быть: `Название, артикул`.\n"
+                "Пример: `Кофе Арабика 250г, COF-001`",
                 kb=_kb_names())
             return
         name = ", ".join(parts[:-1])
@@ -431,35 +448,44 @@ async def _handle_message(msg: dict, deps) -> None:
         # все названия введены → confirm
         s.phase = "confirm"
         cab = _cabinet_label(s.cabinet)
-        dry = "вкл" if settings.DRY_RUN else "выкл"
-        lines = ["📝 *Партия готова к запуску*", "",
-                 f"🏪 Кабинет: *{cab}*",
-                 f"⚙️ DRY_RUN: *{dry}*", ""]
+        lines = [
+            "📝 *Партия готова к запуску*", "",
+            f"🏪 Кабинет: *{cab}*",
+            f"⚙️ DRY\\_RUN: *{_dry_text()}*", "",
+        ]
         for i, p in enumerate(s.products, 1):
             lines.append(f"{i}) {p['name']} `{p['sku']}`")
         lines.append("")
-        lines.append(f"Всего *{len(s.products)} товаров* × 4 фото = *{len(s.products) * 4}* изображений")
-        # confirm-сообщение тоже inline
-        await _send(deps, chat_id, "_Подтверди запуск_", kb=_kb_remove())
-        res = await deps.tg.send_with_buttons(
-            chat_id, "\n".join(lines),
-            [
-                [{"text": "▶ Запустить генерацию", "callback_data": "flow:run"}],
-                [{"text": "✖ Отмена", "callback_data": "flow:cancel"}],
-            ],
-        )
-        if res and res.get("message_id"):
-            s.menu_message_id = res["message_id"]
+        lines.append(f"Всего *{len(s.products)} товаров* × 4 фото = "
+                     f"*{len(s.products) * 4}* изображений")
+        lines.append("")
+        lines.append("Жми «▶️ Запустить генерацию».")
+        await _send(deps, chat_id, "\n".join(lines), kb=_kb_confirm())
         return
 
     if s.phase == "confirm":
-        # Жмут на reply-кнопки в этой фазе — подсказываем
-        await _send(deps, chat_id, "Жми кнопку под предыдущим сообщением: ▶ Запустить или ✖ Отмена.")
+        if text == BTN_RUN:
+            await _start_pipeline(chat_id, deps, s)
+            return
+        if text == BTN_CONFIRM_BACK:
+            # вернёмся к редактированию названий — упрощаем: просим заново
+            s.phase = "names"
+            s.products = []
+            await _send(deps, chat_id,
+                "Возвращаемся к названиям. Введи снова `Название, артикул` "
+                f"для *фото №1* (всего {len(s.photos)}):",
+                kb=_kb_names())
+            return
+        await _send(deps, chat_id,
+            "Жми «▶️ Запустить генерацию», «◀️ Назад к названиям» или «🔄 Сбросить партию».",
+            kb=_kb_confirm())
         return
 
     if s.phase == "running":
         await _send(deps, chat_id,
-            "⏳ Партия уже идёт. Жди отчёт. /reset — отменит сессию (но не остановит уже запущенный пайплайн).")
+            "⏳ Партия уже идёт. Жди отчёт. /reset отменит сессию "
+            "(но не остановит уже запущенный пайплайн).",
+            kb=_kb_running())
         return
 
 
@@ -479,19 +505,14 @@ async def _start_pipeline(chat_id: int, deps, s: TgSession) -> None:
     req = RunRequest(batch_id=batch_id, chat_id=chat_id, products=products,
                      cabinet_names=cabinet_names)
     cab_label = _cabinet_label(s.cabinet)
-    dry = "вкл" if settings.DRY_RUN else "выкл"
+    dry = _dry_text()
 
-    if s.menu_message_id:
-        await deps.tg.edit_message_text(
-            chat_id, s.menu_message_id,
-            f"🚀 *Партия* `{batch_id}` запущена\n\n"
-            f"🏪 {cab_label}\n⚙️ DRY_RUN: {dry}\n\n_Прогресс пришлю отдельными сообщениями._",
-            buttons=[],
-        )
-    else:
-        await _send(deps, chat_id,
-                    f"🚀 Партия `{batch_id}` запущена → {cab_label} (DRY_RUN: {dry})",
-                    kb=_kb_remove())
+    await _send(deps, chat_id,
+        f"🚀 *Партия* `{batch_id}` запущена\n\n"
+        f"🏪 Кабинет: *{cab_label}*\n"
+        f"⚙️ DRY\\_RUN: *{dry}*\n\n"
+        "_Прогресс пришлю отдельными сообщениями._",
+        kb=_kb_running())
 
     asyncio.create_task(_run_and_cleanup(req, deps, chat_id))
 
@@ -504,6 +525,8 @@ async def _run_and_cleanup(req: RunRequest, deps, chat_id: int) -> None:
         s = _sessions.get(chat_id)
         if s and s.phase == "running":
             cab = s.cabinet
-            _sessions[chat_id] = TgSession(cabinet=cab)
-            # после завершения покажем главное меню
-            await _send_main_menu(deps, chat_id, _sessions[chat_id])
+            new_s = TgSession(cabinet=cab)
+            _sessions[chat_id] = new_s
+            await _send(deps, chat_id,
+                "🏁 *Партия завершена.* Можно запускать следующую.",
+                kb=_kb_main(new_s))
