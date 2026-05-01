@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     WB_BASE: str = "https://content-api.wildberries.ru"
     WB_TOKEN: str | None = None
 
+    # DRY_RUN: при True upload_ozon / upload_wb НЕ делают реальные POST в API
+    # маркетплейсов — собирают payload, шлют его в TG как JSON-документ и
+    # возвращают Report со статусом "[DRY_RUN] payload готов, не отправлен".
+    # Используется чтобы безопасно прогнать этапы 1-5 на боевых токенах
+    # без публикации товаров в кабинетах продавца.
+    DRY_RUN: bool = False
+
     # Runtime — параллельные товары (внутри товара: main → потом 3 параллельно).
     # Глобальный лимит kie.ai = 8 параллельных запросов (KieAIClient._sem),
     # так что фактический параллелизм ограничен этим.

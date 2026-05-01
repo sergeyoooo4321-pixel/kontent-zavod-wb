@@ -511,7 +511,41 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
     }
 
 
-async def upload_ozon(states: list[ProductState], cat_data: dict[tuple, CategoryData], deps: Deps) -> Report:
+async def _send_dry_run_payload(
+    chat_id: int | None,
+    deps: Deps,
+    mp: str,
+    endpoint: str,
+    payload: dict,
+    n_items: int,
+) -> None:
+    """DRY_RUN: шлём в TG короткое summary + JSON-документ с payload."""
+    if chat_id is None:
+        return
+    import json as _json
+    try:
+        await deps.tg.send(
+            chat_id,
+            f"🧪 *DRY\\_RUN {mp.upper()}* — собран payload на *{n_items}* items\n"
+            f"endpoint: `{endpoint}`\n"
+            f"в API ничего не отправлено, JSON ниже",
+            parse_mode="Markdown",
+        )
+        body = _json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
+        await deps.tg.send_document(
+            chat_id, body, f"{mp}_payload.json",
+            caption=f"[DRY_RUN] {mp} payload, {n_items} items",
+        )
+    except Exception as e:
+        logger.warning("dry_run TG send fail (%s): %s", mp, e)
+
+
+async def upload_ozon(
+    states: list[ProductState],
+    cat_data: dict[tuple, CategoryData],
+    deps: Deps,
+    chat_id: int | None = None,
+) -> Report:
     rep = Report(batch_id="", total=0, successes=[], errors=[], warnings=[])
     if not settings.has_ozon_creds:
         for s in states:
@@ -543,6 +577,21 @@ async def upload_ozon(states: list[ProductState], cat_data: dict[tuple, Category
     if not items:
         return rep
 
+    rep.total = len(items)
+
+    # ── DRY_RUN: ничего не отправляем, шлём payload в TG ──────
+    if settings.DRY_RUN:
+        logger.info("[DRY_RUN] upload_ozon: %d items would be sent", len(items))
+        await _send_dry_run_payload(
+            chat_id, deps, "ozon", "POST /v3/product/import", {"items": items}, len(items),
+        )
+        for sku in sku_to_state:
+            rep.warnings.append(ReportItem(
+                sku=sku, mp="ozon",
+                reason="[DRY_RUN] payload готов, в API не отправлено",
+            ))
+        return rep
+
     try:
         task_id = await deps.ozon.import_products(items)
         result = await deps.ozon.import_wait(task_id)
@@ -558,7 +607,6 @@ async def upload_ozon(states: list[ProductState], cat_data: dict[tuple, Category
         for sku, s in sku_to_state.items():
             rep.errors.append(ReportItem(sku=sku, mp="ozon", reason=str(e)))
 
-    rep.total = len(items)
     return rep
 
 
@@ -593,7 +641,12 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
     }
 
 
-async def upload_wb(states: list[ProductState], cat_data: dict, deps: Deps) -> Report:
+async def upload_wb(
+    states: list[ProductState],
+    cat_data: dict,
+    deps: Deps,
+    chat_id: int | None = None,
+) -> Report:
     rep = Report(batch_id="", total=0, successes=[], errors=[], warnings=[])
     if not settings.has_wb_creds:
         for s in states:
@@ -617,6 +670,21 @@ async def upload_wb(states: list[ProductState], cat_data: dict, deps: Deps) -> R
     if not cards:
         return rep
 
+    rep.total = len(cards)
+
+    # ── DRY_RUN: ничего не отправляем, шлём payload в TG ──────
+    if settings.DRY_RUN:
+        logger.info("[DRY_RUN] upload_wb: %d cards would be sent", len(cards))
+        await _send_dry_run_payload(
+            chat_id, deps, "wb", "POST /content/v2/cards/upload", {"cards": cards}, len(cards),
+        )
+        for c in cards:
+            rep.warnings.append(ReportItem(
+                sku=c["vendorCode"], mp="wb",
+                reason="[DRY_RUN] payload готов, в API не отправлено",
+            ))
+        return rep
+
     try:
         await deps.wb.upload_cards(cards)
         vendor_codes = [c["vendorCode"] for c in cards]
@@ -632,7 +700,6 @@ async def upload_wb(states: list[ProductState], cat_data: dict, deps: Deps) -> R
         for c in cards:
             rep.errors.append(ReportItem(sku=c["vendorCode"], mp="wb", reason=str(e)))
 
-    rep.total = len(cards)
     return rep
 
 
@@ -685,10 +752,19 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
         # Этап 4: тексты + расширение SKU
         await asyncio.gather(*[build_skus_and_texts(s, cat_data, deps) for s in states])
 
+        if settings.DRY_RUN:
+            await deps.tg.send(
+                req.chat_id,
+                "🧪 *DRY\\_RUN* включён — Этап 5: payload-ы соберутся "
+                "и придут в чат как JSON-документы, но в API маркетплейсов "
+                "ничего не отправляется.",
+                parse_mode="Markdown",
+            )
+
         # Этап 5: заливка (V7 — return_exceptions, чтобы одна сторона не валила другую)
         results = await asyncio.gather(
-            upload_ozon(states, cat_data, deps),
-            upload_wb(states, cat_data, deps),
+            upload_ozon(states, cat_data, deps, chat_id=req.chat_id),
+            upload_wb(states, cat_data, deps, chat_id=req.chat_id),
             return_exceptions=True,
         )
         ozon_rep = results[0] if isinstance(results[0], Report) else Report(
