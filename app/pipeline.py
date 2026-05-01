@@ -732,6 +732,12 @@ async def upload_ozon(
 
 
 def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
+    """Возвращает IMT-объект для WB v2 в формате {subjectID, variants:[variant]}.
+
+    WB Content API v2 ждёт массив IMT-карточек, у каждой свой subjectID и
+    список variants (это разные цвета/размеры одной модели). У нас на каждый
+    SKU свой IMT с одним variant.
+    """
     titles = state.titles.get(sku_row["sku"], {})
     images = state.images
     main = images.get("main") or state.src_url
@@ -741,13 +747,11 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
     hero = pack_url or main or state.src_url
     media = [u for u in (hero, extra) if u]
     characteristics = state.characteristics_wb.get(sku_row["sku"]) or []
-    # §5.2 ТЗ: WB-группы — внутри одного бренда + одной категории. Разные бренды
-    # в одну группу не объединяются. Формируем groupName как "<brand>_<subjectID>".
+    # §5.2 ТЗ: WB-группы — внутри одного бренда + одной категории.
     subject_id = state.wb_subject.id if state.wb_subject else 0
     brand = (state.brand or "").strip()
     group_name = f"{brand}_{subject_id}" if brand and subject_id else (brand or f"sub_{subject_id}")
-    return {
-        "subjectID": subject_id,
+    variant = {
         "vendorCode": sku_row["sku"],
         "title": titles.get("title_wb_short", state.name),
         "description": titles.get("annotation_ozon", ""),
@@ -763,6 +767,7 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
         "sizes": [{"techSize": "0", "wbSize": "0", "price": 0, "skus": [sku_row["sku"]]}],
         "mediaFiles": media,
     }
+    return {"subjectID": subject_id, "variants": [variant]}
 
 
 async def upload_wb(
@@ -803,25 +808,34 @@ async def upload_wb(
     if not cards:
         return rep
 
-    rep.total = len(cards)
+    # cards теперь = [{"subjectID":..., "variants":[{...}]}], vendor-коды из variants
+    def _vendors(imt_list: list[dict]) -> list[str]:
+        out: list[str] = []
+        for imt in imt_list:
+            for v in imt.get("variants") or []:
+                if v.get("vendorCode"):
+                    out.append(v["vendorCode"])
+        return out
+
+    vendor_codes = _vendors(cards)
+    rep.total = len(vendor_codes)
 
     # ── DRY_RUN: ничего не отправляем, шлём payload в TG ──────
     if settings.DRY_RUN:
-        logger.info("[DRY_RUN] upload_wb[%s]: %d cards would be sent", cab_label, len(cards))
+        logger.info("[DRY_RUN] upload_wb[%s]: %d cards would be sent", cab_label, len(vendor_codes))
         await _send_dry_run_payload(
             chat_id, deps, f"wb ({cab_label})", "POST /content/v2/cards/upload",
-            {"cabinet": cab_label, "cards": cards}, len(cards),
+            {"cabinet": cab_label, "cards": cards}, len(vendor_codes),
         )
-        for c in cards:
+        for vc in vendor_codes:
             rep.warnings.append(ReportItem(
-                sku=c["vendorCode"], mp=cab_tag,
+                sku=vc, mp=cab_tag,
                 reason="[DRY_RUN] payload готов, в API не отправлено",
             ))
         return rep
 
     try:
         await wb_client.upload_cards(cards)
-        vendor_codes = [c["vendorCode"] for c in cards]
         status = await wb_client.upload_wait(vendor_codes)
         for c in status.get("data", {}).get("cards") or []:
             vc = c.get("vendorCode")
@@ -832,8 +846,8 @@ async def upload_wb(
             else:
                 rep.successes.append(ReportItem(sku=vc, mp=cab_tag))
     except WBError as e:
-        for c in cards:
-            rep.errors.append(ReportItem(sku=c["vendorCode"], mp=cab_tag, reason=str(e)))
+        for vc in vendor_codes:
+            rep.errors.append(ReportItem(sku=vc, mp=cab_tag, reason=str(e)))
 
     return rep
 

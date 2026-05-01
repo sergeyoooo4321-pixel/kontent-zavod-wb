@@ -68,8 +68,8 @@ def test_write_product_state(tmp_cases_dir):
     assert obj["warnings"][0].startswith("A:")
 
 
-def test_groupname_in_wb_card():
-    """§5.2 ТЗ: groupName = brand + subjectID."""
+def test_wb_card_imt_format():
+    """WB v2 формат: {subjectID, variants:[variant]} + groupName внутри variant."""
     from app.models import CategoryRef, ProductState
     from app.pipeline import _build_wb_card
 
@@ -80,13 +80,20 @@ def test_groupname_in_wb_card():
 
     sku_row = {"sku": "X", "qty": 1, "weight_packed_g": 100, "weight_wb_kg": 0.1,
                "dims": {"l": 10, "w": 5, "h": 3}}
-    card = _build_wb_card(s, sku_row)
+    imt = _build_wb_card(s, sku_row)
 
-    assert card["groupName"] == "Profit_4459"
-    assert card["subjectID"] == 4459
+    # IMT-обёртка
+    assert imt["subjectID"] == 4459
+    assert isinstance(imt["variants"], list) and len(imt["variants"]) == 1
+    # variant внутри
+    v = imt["variants"][0]
+    assert v["vendorCode"] == "X"
+    assert v["groupName"] == "Profit_4459"
+    assert v["brand"] == "Profit"
+    assert v["mediaFiles"] == ["https://s3/X_main.jpg"]
 
 
-def test_groupname_no_brand():
+def test_wb_card_no_brand():
     """Если brand пустой — groupName всё равно валиден (sub_<id>)."""
     from app.models import CategoryRef, ProductState
     from app.pipeline import _build_wb_card
@@ -98,5 +105,5 @@ def test_groupname_no_brand():
 
     sku_row = {"sku": "X", "qty": 1, "weight_packed_g": 100, "weight_wb_kg": 0.1,
                "dims": {"l": 10, "w": 5, "h": 3}}
-    card = _build_wb_card(s, sku_row)
-    assert card["groupName"].startswith("sub_4459")
+    imt = _build_wb_card(s, sku_row)
+    assert imt["variants"][0]["groupName"].startswith("sub_4459")
