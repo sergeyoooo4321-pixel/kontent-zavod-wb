@@ -9,18 +9,28 @@ from app.pipeline import CategoryData, Deps, upload_ozon, upload_wb
 
 
 def _state(sku: str = "TEST_001") -> ProductState:
-    s = ProductState(idx=0, sku=sku, name="Тестовый товар", tg_file_id="A" * 40)
+    s = ProductState(idx=0, sku=sku, name="Тестовый товар", tg_file_id="A" * 40, brand="TestBrand")
     s.ozon_category = CategoryRef(id=17027949, type_id=92364, path="Категории / Тест")
     s.wb_subject = CategoryRef(id=4459, path="Тест WB")
     s.images = {"main": f"https://s3/{sku}_main.jpg"}
     s.src_url = f"https://s3/{sku}_src.jpg"
     s.skus_3 = [
-        {"sku": sku, "qty": 1, "weight_packed_g": 100, "weight_wb_kg": 0.1,
-         "dims": {"l": 10, "w": 5, "h": 3}},
+        {"sku": sku, "qty": 1, "weight_unit_g": 100, "weight_packed_g": 100,
+         "weight_wb_kg": 0.1, "dims": {"l": 10, "w": 5, "h": 3}},
     ]
-    s.titles[sku] = {"title_ozon": "X", "title_wb_short": "X", "title_wb_full": "X",
-                     "annotation_ozon": "Y", "composition_wb": "Z"}
-    s.attributes_ozon[sku] = []
+    s.titles[sku] = {
+        "title_ozon": "TestBrand Тестовый товар 100 г",
+        "title_wb_short": "Тестовый товар 100 г",
+        "title_wb_full": "TestBrand Тестовый товар 100 г",
+        # Аннотация ≥6 предложений (auto-fix всё равно дополнит, но дадим уже валидную)
+        "annotation_ozon": (
+            "Это первое предложение. Это второе предложение. Это третье. "
+            "Это четвёртое. Это пятое. Это шестое."
+        ),
+        "composition_wb": "Тестовый состав",
+    }
+    # ВАЖНО: pre-flight требует attributes — без них SKU блокируется
+    s.attributes_ozon[sku] = [{"id": 85, "values": [{"value": "TestBrand"}]}]
     s.characteristics_wb[sku] = []
     return s
 

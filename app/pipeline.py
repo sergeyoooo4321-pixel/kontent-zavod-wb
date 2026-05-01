@@ -37,7 +37,12 @@ from .normalize import (
     wb_group_name,
 )
 from .ozon import OzonClient, OzonError
-from .validation import validate_ozon_item, validate_ozon_item_qty, validate_wb_imt
+from .validation import (
+    expand_short_description,
+    validate_ozon_item,
+    validate_ozon_item_qty,
+    validate_wb_imt,
+)
 from .prompts import (
     build_attributes_prompts,
     build_category_prompts,
@@ -657,7 +662,7 @@ def _ensure_attr(
     })
 
 
-def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: CategoryData) -> dict:
+def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: CategoryData) -> dict | None:
     """Собирает один item для POST /v3/product/import по правилам §11 регламента.
 
     Реализует:
@@ -689,6 +694,12 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
         if unit_attr_id:
             _ensure_attr(attributes, unit_attr_id, str(unit_w))
 
+    # Auto-fix описания до ≥6 предложений (§11.5) если LLM выдала меньше
+    description = expand_short_description(
+        titles.get("annotation_ozon", ""),
+        brand=state.brand, name=state.name, qty=sku_row["qty"],
+    )
+
     item = {
         "offer_id": sku_row["sku"],
         "name": titles.get("title_ozon", state.name),
@@ -706,14 +717,21 @@ def _build_ozon_item(state: ProductState, sku_row: dict[str, Any], cat: Category
         "dimension_unit": "cm",
         "images": image_urls,
         "attributes": attributes,
-        "description": titles.get("annotation_ozon", ""),
+        "description": description,
     }
-    # Pre-flight локальная валидация — кладём warnings в state, не блокируем отправку
-    issues = validate_ozon_item(item) + validate_ozon_item_qty(item, sku_row["qty"])
-    if issues:
-        for issue in issues:
-            state.warnings.append(f"ozon {sku_row['sku']}: {issue}")
-        logger.warning("ozon validation %s: %d issues", sku_row["sku"], len(issues))
+    # Pre-flight: errors блокируют отправку, warnings — нет.
+    e1, w1 = validate_ozon_item(item)
+    e2, w2 = validate_ozon_item_qty(item, sku_row["qty"])
+    errors = e1 + e2
+    warnings = w1 + w2
+    for w in warnings:
+        state.warnings.append(f"ozon {sku_row['sku']}: {w}")
+    if errors:
+        for e in errors:
+            state.errors.append(f"ozon {sku_row['sku']}: {e}")
+        logger.warning("ozon %s SKIPPED — %d errors: %s",
+                       sku_row["sku"], len(errors), errors[0])
+        return None  # type: ignore[return-value]
     return item
 
 
@@ -787,7 +805,15 @@ async def upload_ozon(
                     reason="required attribute missing (см. state.errors)",
                 ))
                 continue
-            items.append(_build_ozon_item(s, row, cat))
+            built = _build_ozon_item(s, row, cat)
+            if built is None:
+                # Pre-flight забраковал — не отправляем эту SKU
+                rep.errors.append(ReportItem(
+                    sku=row["sku"], mp=cab_tag,
+                    reason="pre-flight отверг (см. state.errors)",
+                ))
+                continue
+            items.append(built)
             sku_to_state[row["sku"]] = s
 
     if not items:
@@ -831,7 +857,7 @@ async def upload_ozon(
 # ─── Этап 5: заливка WB ─────────────────────────────────────────
 
 
-def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
+def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict | None:
     """Возвращает IMT-объект для WB v2 в формате {subjectID, variants:[variant]}.
 
     WB Content API v2 ждёт массив IMT-карточек, у каждой свой subjectID и
@@ -868,12 +894,15 @@ def _build_wb_card(state: ProductState, sku_row: dict[str, Any]) -> dict:
         "mediaFiles": media,
     }
     imt = {"subjectID": subject_id, "variants": [variant]}
-    # Pre-flight локальная валидация WB
-    issues = validate_wb_imt(imt, brand=brand)
-    if issues:
-        for issue in issues:
-            state.warnings.append(f"wb {sku_row['sku']}: {issue}")
-        logger.warning("wb validation %s: %d issues", sku_row["sku"], len(issues))
+    errors, warnings = validate_wb_imt(imt, brand=brand)
+    for w in warnings:
+        state.warnings.append(f"wb {sku_row['sku']}: {w}")
+    if errors:
+        for e in errors:
+            state.errors.append(f"wb {sku_row['sku']}: {e}")
+        logger.warning("wb %s SKIPPED — %d errors: %s",
+                       sku_row["sku"], len(errors), errors[0])
+        return None  # type: ignore[return-value]
     return imt
 
 
@@ -910,7 +939,14 @@ async def upload_wb(
                     reason="required characteristic missing (см. state.errors)",
                 ))
                 continue
-            cards.append(_build_wb_card(s, row))
+            built = _build_wb_card(s, row)
+            if built is None:
+                rep.errors.append(ReportItem(
+                    sku=row["sku"], mp=cab_tag,
+                    reason="pre-flight отверг (см. state.errors)",
+                ))
+                continue
+            cards.append(built)
 
     if not cards:
         return rep
