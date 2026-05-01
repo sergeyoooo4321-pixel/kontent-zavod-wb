@@ -240,19 +240,38 @@ class KieAIClient:
         seed: int | None = None,
         max_retries: int = 2,
     ) -> str:
-        """create_image_task_with_retry + poll → URL результата."""
-        task_id = await self.create_image_task_with_retry(
-            prompt=prompt,
-            input_urls=input_urls,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-            model=model,
-            image_weight=image_weight,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            max_retries=max_retries,
+        """Create + poll с retry на ОБОИХ этапах.
+
+        Retry полного цикла нужен для safety-rejects (OpenAI блочит товар, но
+        повторная попытка с новым внутренним рандомом часто проходит) и для
+        прочих task-failure (timeout, ratelimit-by-task, etc).
+        """
+        last_err: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                task_id = await self.create_image_task_with_retry(
+                    prompt=prompt,
+                    input_urls=input_urls,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    model=model,
+                    image_weight=image_weight,
+                    guidance_scale=guidance_scale,
+                    seed=seed,
+                    max_retries=max_retries,
+                )
+                return await self.poll_image_task(task_id)
+            except (KieAIError, KieAITimeout) as e:
+                last_err = e
+                logger.warning(
+                    "generate_image full-cycle retry %d/%d: %s",
+                    attempt + 1, max_retries + 1, str(e)[:200],
+                )
+                if attempt < max_retries:
+                    await asyncio.sleep(2 ** attempt)
+        raise KieAIError(
+            f"generate_image failed after {max_retries + 1} attempts: {last_err}"
         )
-        return await self.poll_image_task(task_id)
 
     async def generate_image(
         self,

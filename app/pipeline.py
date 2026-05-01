@@ -329,10 +329,31 @@ def _flatten_tree(tree: list[dict], path: str = "", is_ozon: bool = True) -> lis
 
 
 async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves: list[dict], deps: Deps) -> None:
-    """Подбор категории через LLM. Если упало — оставляем None и в errors."""
+    """Подбор категории через LLM. Несколько попыток при пустом/невалидном ответе.
+
+    gpt-5-2 иногда возвращает пустой content при response_format=json_object —
+    делаем 3 попытки с экспоненциальным бэкоффом и температурой чуть выше на повторе.
+    """
+    system, user = build_category_prompts(state.name, ozon_leaves, wb_leaves)
+    resp: dict | None = None
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            temp = settings.LLM_TEMPERATURE + (0.1 * attempt)  # 0.2 → 0.3 → 0.4
+            resp = await deps.kie.chat_json(system=system, user=user, temperature=temp)
+            if resp:  # непустой dict
+                break
+        except Exception as e:
+            last_err = e
+            logger.warning("match_category %s attempt %d/3: %s", state.sku, attempt + 1, str(e)[:200])
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+    if not resp:
+        msg = f"category: LLM не вернул валидный JSON за 3 попытки ({last_err or 'empty'})"
+        state.errors.append(msg)
+        logger.error("match_category %s: %s", state.sku, msg)
+        return
     try:
-        system, user = build_category_prompts(state.name, ozon_leaves, wb_leaves)
-        resp = await deps.kie.chat_json(system=system, user=user, temperature=settings.LLM_TEMPERATURE)
         ozon_id = int(resp.get("ozon_id") or 0)
         ozon_type_id = int(resp.get("ozon_type_id") or 0)
         wb_id = int(resp.get("wb_id") or 0)
@@ -350,7 +371,7 @@ async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves
             )
     except Exception as e:
         state.errors.append(f"category: {e}")
-        logger.exception("match_category %s: %s", state.sku, e)
+        logger.exception("match_category %s parse: %s", state.sku, e)
 
 
 # ─── Этап 3: справочники + шаблоны ───────────────────────────────
