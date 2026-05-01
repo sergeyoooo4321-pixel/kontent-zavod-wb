@@ -290,11 +290,44 @@ def _help_text() -> str:
 
 
 async def handle_update(update: dict, deps) -> None:
-    """Вся навигация через reply-кнопки → текстовые сообщения."""
+    """Вся навигация через reply-кнопки → текстовые сообщения.
+
+    Если приходит callback_query (старое inline-меню до перехода на reply-keyboard),
+    закрываем «крутилку» и шлём свежее главное меню.
+    """
+    cq = update.get("callback_query")
+    if cq:
+        chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+        logger.info("tg.update callback_query chat=%s data=%s", chat_id, cq.get("data"))
+        await _handle_legacy_callback(cq, deps)
+        return
     msg = update.get("message")
     if not msg:
-        return  # callback_query больше не используем
+        logger.info("tg.update kind=%s ignored",
+                    next((k for k in update.keys() if k != "update_id"), "unknown"))
+        return
+    chat_id = (msg.get("chat") or {}).get("id")
+    has_photo = bool(msg.get("photo"))
+    text_preview = (msg.get("text") or "")[:40]
+    logger.info("tg.update msg chat=%s photo=%s text=%r", chat_id, has_photo, text_preview)
     await _handle_message(msg, deps)
+
+
+async def _handle_legacy_callback(cq: dict, deps) -> None:
+    """Совместимость со старыми inline-кнопками: отвечаем callback и шлём reply-меню."""
+    cq_id = cq.get("id") or ""
+    chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+    try:
+        await deps.tg.answer_callback_query(cq_id)
+    except Exception:
+        pass
+    if not chat_id:
+        return
+    s = _get_session(chat_id)
+    s.phase = "idle"
+    await _send(deps, chat_id,
+        "Меню обновилось — теперь кнопки внизу экрана. ⬇️",
+        kb=_kb_main(s))
 
 
 async def _handle_message(msg: dict, deps) -> None:
