@@ -24,6 +24,10 @@ class RunRequest(BaseModel):
     batch_id: str
     chat_id: int
     products: list[ProductIn] = Field(min_length=1, max_length=10)
+    # Cabinet routing: список имён кабинетов из settings.list_cabinets().
+    # None / пусто → используем default_cabinet_name (backward-compat).
+    # Несколько имён → mirror-режим: одна и та же карточка во все указанные кабинеты.
+    cabinet_names: list[str] | None = None
 
 
 class RunResponse(BaseModel):

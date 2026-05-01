@@ -59,17 +59,21 @@ async def lifespan(app: FastAPI):
         public_base=settings.S3_PUBLIC_BASE,
         http=http,
     )
-    ozon = OzonClient(
-        base=settings.OZON_BASE,
-        client_id=settings.OZON_CLIENT_ID,
-        api_key=settings.OZON_API_KEY,
-        http=http,
-    )
-    wb = WBClient(base=settings.WB_BASE, token=settings.WB_TOKEN, http=http)
+    # Default-кабинет для backward-compat (используется когда RunRequest не указывает cabinet_names).
+    # Берём первый настроенный кабинет; если кабинетов нет — фоллбэк на "пустые" клиенты,
+    # они вернут осмысленную ошибку при попытке заливки.
+    default_cab_name = settings.default_cabinet_name
+    default_cab = settings.get_cabinet(default_cab_name) if default_cab_name else None
+    ozon_cid = default_cab.ozon.client_id if default_cab and default_cab.has_ozon else (settings.OZON_CLIENT_ID or "")
+    ozon_key = default_cab.ozon.api_key if default_cab and default_cab.has_ozon else (settings.OZON_API_KEY or "")
+    wb_tok = default_cab.wb.token if default_cab and default_cab.has_wb else (settings.WB_TOKEN or "")
+
+    ozon = OzonClient(base=settings.OZON_BASE, client_id=ozon_cid, api_key=ozon_key, http=http)
+    wb = WBClient(base=settings.WB_BASE, token=wb_tok, http=http)
 
     await s3.start()  # долгоживущий aiobotocore-клиент
 
-    app.state.deps = Deps(tg=tg, kie=kie, s3=s3, ozon=ozon, wb=wb)
+    app.state.deps = Deps(tg=tg, kie=kie, s3=s3, ozon=ozon, wb=wb, http=http)
     app.state.http = http
     logger.info("cz-backend started: kie=%s s3=%s ozon=%s wb=%s",
                 settings.KIE_BASE, settings.S3_BUCKET,

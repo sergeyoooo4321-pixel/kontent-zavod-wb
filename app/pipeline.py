@@ -16,7 +16,9 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from .config import settings
+import httpx
+
+from .config import Cabinet, settings
 from .kie_ai import KieAIClient, KieAIError, KieAITimeout
 from .models import (
     CategoryRef,
@@ -53,8 +55,33 @@ class Deps:
     tg: TelegramClient
     kie: KieAIClient
     s3: S3Client
-    ozon: OzonClient
+    ozon: OzonClient  # default-кабинет (backward-compat для api/run и тестов)
     wb: WBClient
+    http: httpx.AsyncClient | None = None  # для создания per-cabinet клиентов
+
+
+def _ozon_client_for(cabinet: Cabinet, deps: Deps) -> OzonClient | None:
+    """Создаёт OzonClient под конкретный кабинет на общем httpx.AsyncClient."""
+    if not cabinet.has_ozon:
+        return None
+    http = deps.http or getattr(deps.ozon, "_http", None)
+    if http is None:
+        return None
+    return OzonClient(
+        base=settings.OZON_BASE,
+        client_id=cabinet.ozon.client_id,
+        api_key=cabinet.ozon.api_key,
+        http=http,
+    )
+
+
+def _wb_client_for(cabinet: Cabinet, deps: Deps) -> WBClient | None:
+    if not cabinet.has_wb:
+        return None
+    http = deps.http or getattr(deps.wb, "_http", None)
+    if http is None:
+        return None
+    return WBClient(base=settings.WB_BASE, token=cabinet.wb.token, http=http)
 
 
 # ─── Этап 1: фото ────────────────────────────────────────────────
@@ -545,12 +572,22 @@ async def upload_ozon(
     cat_data: dict[tuple, CategoryData],
     deps: Deps,
     chat_id: int | None = None,
+    cabinet: Cabinet | None = None,
 ) -> Report:
+    """Заливка на Ozon. Если cabinet задан — используем его клиента, иначе deps.ozon."""
     rep = Report(batch_id="", total=0, successes=[], errors=[], warnings=[])
-    if not settings.has_ozon_creds:
+    cab_label = cabinet.label if cabinet else "default"
+    cab_tag = f"ozon[{cab_label}]"
+
+    ozon_client = _ozon_client_for(cabinet, deps) if cabinet else deps.ozon
+    if cabinet and not cabinet.has_ozon:
+        # У этого кабинета вообще нет Ozon (например progress247 — только WB) — тихо пропускаем
+        return rep
+    if ozon_client is None or (not cabinet and not settings.has_ozon_creds):
         for s in states:
             for sku_row in s.skus_3 or []:
-                rep.errors.append(ReportItem(sku=sku_row["sku"], mp="ozon", reason="OZON creds not set"))
+                rep.errors.append(ReportItem(sku=sku_row["sku"], mp=cab_tag,
+                                             reason="OZON creds not set"))
         return rep
 
     # Собираем items[]
@@ -581,31 +618,33 @@ async def upload_ozon(
 
     # ── DRY_RUN: ничего не отправляем, шлём payload в TG ──────
     if settings.DRY_RUN:
-        logger.info("[DRY_RUN] upload_ozon: %d items would be sent", len(items))
+        logger.info("[DRY_RUN] upload_ozon[%s]: %d items would be sent", cab_label, len(items))
         await _send_dry_run_payload(
-            chat_id, deps, "ozon", "POST /v3/product/import", {"items": items}, len(items),
+            chat_id, deps, f"ozon ({cab_label})", "POST /v3/product/import",
+            {"cabinet": cab_label, "items": items}, len(items),
         )
         for sku in sku_to_state:
             rep.warnings.append(ReportItem(
-                sku=sku, mp="ozon",
+                sku=sku, mp=cab_tag,
                 reason="[DRY_RUN] payload готов, в API не отправлено",
             ))
         return rep
 
     try:
-        task_id = await deps.ozon.import_products(items)
-        result = await deps.ozon.import_wait(task_id)
+        task_id = await ozon_client.import_products(items)
+        result = await ozon_client.import_wait(task_id)
         for it in result.get("result", {}).get("items") or []:
             offer_id = it.get("offer_id")
             status = it.get("status")
             if status == "imported":
-                rep.successes.append(ReportItem(sku=offer_id, mp="ozon", marketplace_id=str(it.get("product_id") or "")))
+                rep.successes.append(ReportItem(sku=offer_id, mp=cab_tag,
+                                                marketplace_id=str(it.get("product_id") or "")))
             else:
                 err_msg = ((it.get("errors") or [{}])[0].get("message")) or str(status)
-                rep.errors.append(ReportItem(sku=offer_id, mp="ozon", reason=err_msg))
+                rep.errors.append(ReportItem(sku=offer_id, mp=cab_tag, reason=err_msg))
     except OzonError as e:
         for sku, s in sku_to_state.items():
-            rep.errors.append(ReportItem(sku=sku, mp="ozon", reason=str(e)))
+            rep.errors.append(ReportItem(sku=sku, mp=cab_tag, reason=str(e)))
 
     return rep
 
@@ -646,12 +685,21 @@ async def upload_wb(
     cat_data: dict,
     deps: Deps,
     chat_id: int | None = None,
+    cabinet: Cabinet | None = None,
 ) -> Report:
+    """Заливка на WB. Если cabinet задан — используем его клиента, иначе deps.wb."""
     rep = Report(batch_id="", total=0, successes=[], errors=[], warnings=[])
-    if not settings.has_wb_creds:
+    cab_label = cabinet.label if cabinet else "default"
+    cab_tag = f"wb[{cab_label}]"
+
+    wb_client = _wb_client_for(cabinet, deps) if cabinet else deps.wb
+    if cabinet and not cabinet.has_wb:
+        return rep
+    if wb_client is None or (not cabinet and not settings.has_wb_creds):
         for s in states:
             for sku_row in s.skus_3 or []:
-                rep.errors.append(ReportItem(sku=sku_row["sku"], mp="wb", reason="WB creds not set"))
+                rep.errors.append(ReportItem(sku=sku_row["sku"], mp=cab_tag,
+                                             reason="WB creds not set"))
         return rep
 
     cards: list[dict] = []
@@ -674,31 +722,33 @@ async def upload_wb(
 
     # ── DRY_RUN: ничего не отправляем, шлём payload в TG ──────
     if settings.DRY_RUN:
-        logger.info("[DRY_RUN] upload_wb: %d cards would be sent", len(cards))
+        logger.info("[DRY_RUN] upload_wb[%s]: %d cards would be sent", cab_label, len(cards))
         await _send_dry_run_payload(
-            chat_id, deps, "wb", "POST /content/v2/cards/upload", {"cards": cards}, len(cards),
+            chat_id, deps, f"wb ({cab_label})", "POST /content/v2/cards/upload",
+            {"cabinet": cab_label, "cards": cards}, len(cards),
         )
         for c in cards:
             rep.warnings.append(ReportItem(
-                sku=c["vendorCode"], mp="wb",
+                sku=c["vendorCode"], mp=cab_tag,
                 reason="[DRY_RUN] payload готов, в API не отправлено",
             ))
         return rep
 
     try:
-        await deps.wb.upload_cards(cards)
+        await wb_client.upload_cards(cards)
         vendor_codes = [c["vendorCode"] for c in cards]
-        status = await deps.wb.upload_wait(vendor_codes)
+        status = await wb_client.upload_wait(vendor_codes)
         for c in status.get("data", {}).get("cards") or []:
             vc = c.get("vendorCode")
             errs = c.get("errors") or []
             if errs:
-                rep.errors.append(ReportItem(sku=vc, mp="wb", reason="; ".join(str(x) for x in errs)))
+                rep.errors.append(ReportItem(sku=vc, mp=cab_tag,
+                                             reason="; ".join(str(x) for x in errs)))
             else:
-                rep.successes.append(ReportItem(sku=vc, mp="wb"))
+                rep.successes.append(ReportItem(sku=vc, mp=cab_tag))
     except WBError as e:
         for c in cards:
-            rep.errors.append(ReportItem(sku=c["vendorCode"], mp="wb", reason=str(e)))
+            rep.errors.append(ReportItem(sku=c["vendorCode"], mp=cab_tag, reason=str(e)))
 
     return rep
 
@@ -752,38 +802,70 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
         # Этап 4: тексты + расширение SKU
         await asyncio.gather(*[build_skus_and_texts(s, cat_data, deps) for s in states])
 
+        # Какие кабинеты используем для заливки
+        target_cabinets: list[Cabinet] = []
+        if req.cabinet_names:
+            for name in req.cabinet_names:
+                c = settings.get_cabinet(name)
+                if c:
+                    target_cabinets.append(c)
+                else:
+                    logger.warning("run_batch: cabinet '%s' not found", name)
+        else:
+            # backward-compat: один default-кабинет
+            default_name = settings.default_cabinet_name
+            if default_name:
+                c = settings.get_cabinet(default_name)
+                if c:
+                    target_cabinets.append(c)
+
+        if not target_cabinets:
+            await deps.tg.send(req.chat_id,
+                               "⚠️ Этап 5 пропущен: ни один кабинет не настроен.")
+            return
+
+        cab_labels = ", ".join(c.label for c in target_cabinets)
         if settings.DRY_RUN:
             await deps.tg.send(
                 req.chat_id,
                 "🧪 *DRY\\_RUN* включён — Этап 5: payload-ы соберутся "
-                "и придут в чат как JSON-документы, но в API маркетплейсов "
-                "ничего не отправляется.",
+                "и придут в чат как JSON-документы, в API маркетплейсов "
+                "ничего не отправляется.\n"
+                f"Целевые кабинеты: *{cab_labels}*",
+                parse_mode="Markdown",
+            )
+        else:
+            await deps.tg.send(
+                req.chat_id,
+                f"🚚 Этап 5: заливка в *{len(target_cabinets)}* кабинет(а): {cab_labels}",
                 parse_mode="Markdown",
             )
 
-        # Этап 5: заливка (V7 — return_exceptions, чтобы одна сторона не валила другую)
-        results = await asyncio.gather(
-            upload_ozon(states, cat_data, deps, chat_id=req.chat_id),
-            upload_wb(states, cat_data, deps, chat_id=req.chat_id),
-            return_exceptions=True,
-        )
-        ozon_rep = results[0] if isinstance(results[0], Report) else Report(
-            batch_id=req.batch_id, total=0,
-            errors=[ReportItem(sku="*", mp="ozon", reason=str(results[0])[:200])],
-        )
-        wb_rep = results[1] if isinstance(results[1], Report) else Report(
-            batch_id=req.batch_id, total=0,
-            errors=[ReportItem(sku="*", mp="wb", reason=str(results[1])[:200])],
-        )
+        # Этап 5: для каждого кабинета параллельно ozon + wb
+        # gather с return_exceptions, чтобы один проблемный кабинет не валил остальные
+        all_reports: list[Report] = []
+        for cab in target_cabinets:
+            cab_results = await asyncio.gather(
+                upload_ozon(states, cat_data, deps, chat_id=req.chat_id, cabinet=cab),
+                upload_wb(states, cat_data, deps, chat_id=req.chat_id, cabinet=cab),
+                return_exceptions=True,
+            )
+            for res in cab_results:
+                if isinstance(res, Report):
+                    all_reports.append(res)
+                else:
+                    all_reports.append(Report(
+                        batch_id=req.batch_id, total=0,
+                        errors=[ReportItem(sku="*", mp=cab.label, reason=str(res)[:200])],
+                    ))
 
-        # Финальный отчёт
-        final = Report(
-            batch_id=req.batch_id,
-            total=ozon_rep.total + wb_rep.total,
-            successes=ozon_rep.successes + wb_rep.successes,
-            errors=ozon_rep.errors + wb_rep.errors,
-            warnings=ozon_rep.warnings + wb_rep.warnings,
-        )
+        # Финальный отчёт = сумма по всем кабинетам
+        final = Report(batch_id=req.batch_id, total=0)
+        for r in all_reports:
+            final.total += r.total
+            final.successes.extend(r.successes)
+            final.errors.extend(r.errors)
+            final.warnings.extend(r.warnings)
         # plus per-product errors из state'ов
         for s in states:
             for err in s.errors:

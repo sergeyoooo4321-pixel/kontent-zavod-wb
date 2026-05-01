@@ -157,6 +157,92 @@ class TelegramClient:
             return
         logger.info("tg.media_group chat_id=%s count=%d", chat_id, len(media))
 
+    async def send_with_buttons(
+        self,
+        chat_id: int,
+        text: str,
+        buttons: list[list[dict]],
+        parse_mode: str | None = "Markdown",
+    ) -> dict | None:
+        """Отправить сообщение с inline-кнопками.
+
+        buttons — двумерный массив рядов; элемент = {"text": ..., "callback_data": ...}.
+        Возвращает result (содержит message_id) для последующего edit_message_text.
+        """
+        if len(text) > 4096:
+            text = text[:4090] + "…"
+        body: dict = {
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": True,
+            "reply_markup": {"inline_keyboard": buttons},
+        }
+        if parse_mode:
+            body["parse_mode"] = parse_mode
+        r = await self._http.post(f"{self._url}/sendMessage", json=body)
+        if r.status_code >= 400 and parse_mode == "Markdown":
+            body.pop("parse_mode", None)
+            r = await self._http.post(f"{self._url}/sendMessage", json=body)
+        if r.status_code >= 400:
+            logger.warning("send_with_buttons %s: %s", r.status_code, r.text[:200])
+            return None
+        logger.info("tg.send_with_buttons chat_id=%s buttons=%d", chat_id,
+                    sum(len(row) for row in buttons))
+        return r.json().get("result")
+
+    async def edit_message_text(
+        self,
+        chat_id: int,
+        message_id: int,
+        text: str,
+        buttons: list[list[dict]] | None = None,
+        parse_mode: str | None = "Markdown",
+    ) -> bool:
+        """Редактировать ранее отправленное сообщение.
+
+        Используется для кнопок-меню — нажал, текст и клавиатура обновились
+        в том же сообщении (а не плодим новые).
+        """
+        if len(text) > 4096:
+            text = text[:4090] + "…"
+        body: dict = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "disable_web_page_preview": True,
+        }
+        if buttons is not None:
+            body["reply_markup"] = {"inline_keyboard": buttons}
+        if parse_mode:
+            body["parse_mode"] = parse_mode
+        r = await self._http.post(f"{self._url}/editMessageText", json=body)
+        if r.status_code >= 400 and parse_mode == "Markdown":
+            body.pop("parse_mode", None)
+            r = await self._http.post(f"{self._url}/editMessageText", json=body)
+        if r.status_code >= 400:
+            # 400 message not modified — нормально, не шумим
+            if "message is not modified" not in r.text.lower():
+                logger.warning("edit_message_text %s: %s", r.status_code, r.text[:200])
+            return False
+        return True
+
+    async def answer_callback_query(
+        self,
+        callback_query_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> None:
+        """Закрыть «крутилку» на нажатой кнопке. Опционально показать toast."""
+        body: dict = {"callback_query_id": callback_query_id}
+        if text:
+            body["text"] = text[:200]
+        if show_alert:
+            body["show_alert"] = True
+        try:
+            await self._http.post(f"{self._url}/answerCallbackQuery", json=body, timeout=5)
+        except Exception as e:
+            logger.warning("answer_callback %s: %s", callback_query_id, e)
+
     @retry(
         retry=retry_if_exception_type((httpx.NetworkError, httpx.ReadTimeout, httpx.WriteTimeout)),
         stop=stop_after_attempt(3),
