@@ -328,31 +328,78 @@ def _flatten_tree(tree: list[dict], path: str = "", is_ozon: bool = True) -> lis
     return out
 
 
-async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves: list[dict], deps: Deps) -> None:
-    """Подбор категории через LLM. Несколько попыток при пустом/невалидном ответе.
+def _filter_leaves_by_keywords(name: str, leaves: list[dict], top_n: int = 50) -> list[dict]:
+    """Pre-фильтр листовых категорий по словам из названия товара.
 
-    gpt-5-2 иногда возвращает пустой content при response_format=json_object —
-    делаем 3 попытки с экспоненциальным бэкоффом и температурой чуть выше на повторе.
+    Простой scoring: сколько слов из name (≥3 символов) содержатся в leaf.path.
+    Возвращает top-N с ненулевым score; если все scores 0 — возвращает первые top-N.
+    Это резко сокращает prompt для LLM (1500 → 50) — gpt-5-2 перестаёт захлёбываться.
     """
-    system, user = build_category_prompts(state.name, ozon_leaves, wb_leaves)
+    import re
+    words = {w.lower() for w in re.findall(r"[\wа-яА-ЯёЁ]{3,}", name)}
+    scored: list[tuple[int, dict]] = []
+    for leaf in leaves:
+        path = (leaf.get("path") or "").lower()
+        score = sum(1 for w in words if w in path)
+        scored.append((score, leaf))
+    scored.sort(key=lambda x: -x[0])
+    nonzero = [l for s, l in scored if s > 0][:top_n]
+    if nonzero:
+        return nonzero
+    # ничего не подошло — берём первые top_n как кандидатов
+    return [l for _, l in scored[:top_n]]
+
+
+async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves: list[dict], deps: Deps) -> None:
+    """Подбор категории через LLM с pre-фильтром по ключевым словам.
+
+    Шаги:
+      1. Pre-фильтр: top-50 наиболее релевантных листов из ozon/wb по словам названия
+         (резко уменьшает prompt — gpt-5-2 на 1500+ категориях возвращал пустой ответ).
+      2. LLM с маленьким prompt — 3 попытки с растущей температурой.
+      3. Если LLM всё равно пуст — fallback на top-1 из keyword-match (без LLM).
+    """
+    ozon_short = _filter_leaves_by_keywords(state.name, ozon_leaves, top_n=50)
+    wb_short = _filter_leaves_by_keywords(state.name, wb_leaves, top_n=50)
+    logger.info("match_category %s: %d ozon + %d wb candidates", state.sku, len(ozon_short), len(wb_short))
+
+    system, user = build_category_prompts(state.name, ozon_short, wb_short, leaves_limit=50)
     resp: dict | None = None
     last_err: Exception | None = None
     for attempt in range(3):
         try:
-            temp = settings.LLM_TEMPERATURE + (0.1 * attempt)  # 0.2 → 0.3 → 0.4
+            temp = settings.LLM_TEMPERATURE + (0.1 * attempt)
             resp = await deps.kie.chat_json(system=system, user=user, temperature=temp)
-            if resp:  # непустой dict
+            if resp:
                 break
         except Exception as e:
             last_err = e
             logger.warning("match_category %s attempt %d/3: %s", state.sku, attempt + 1, str(e)[:200])
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
+
     if not resp:
-        msg = f"category: LLM не вернул валидный JSON за 3 попытки ({last_err or 'empty'})"
-        state.errors.append(msg)
-        logger.error("match_category %s: %s", state.sku, msg)
+        # Fallback: берём top-1 из keyword-match. Хоть какая-то категория лучше,
+        # чем «не определена» (юзер потом сможет поправить в кабинете МП).
+        if ozon_short and wb_short:
+            o0 = ozon_short[0]
+            w0 = wb_short[0]
+            state.ozon_category = CategoryRef(
+                id=int(o0["id"]), type_id=o0.get("type_id"), path=o0.get("path", ""), score=0.3,
+            )
+            state.wb_subject = CategoryRef(
+                id=int(w0["id"]), path=w0.get("path", ""), score=0.3,
+            )
+            warn = (f"category: LLM не отвечает, использую keyword-fallback: "
+                    f"ozon={o0.get('path')!r}, wb={w0.get('path')!r}")
+            state.warnings.append(warn)
+            logger.warning("match_category %s fallback: %s", state.sku, warn)
+        else:
+            state.errors.append(
+                f"category: LLM не ответил и нет кандидатов keyword-match ({last_err or 'empty'})"
+            )
         return
+
     try:
         ozon_id = int(resp.get("ozon_id") or 0)
         ozon_type_id = int(resp.get("ozon_type_id") or 0)
@@ -369,6 +416,17 @@ async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves
             state.wb_subject = CategoryRef(
                 id=wb_id, path=(w or {}).get("path", ""), score=score,
             )
+        # Если LLM вернул валидный JSON но ID-ы не нашлись — fallback на keyword-match
+        if not state.ozon_category and ozon_short:
+            o0 = ozon_short[0]
+            state.ozon_category = CategoryRef(
+                id=int(o0["id"]), type_id=o0.get("type_id"), path=o0.get("path", ""), score=0.3,
+            )
+            state.warnings.append(f"ozon_category: LLM-id не найден, fallback={o0.get('path')!r}")
+        if not state.wb_subject and wb_short:
+            w0 = wb_short[0]
+            state.wb_subject = CategoryRef(id=int(w0["id"]), path=w0.get("path", ""), score=0.3)
+            state.warnings.append(f"wb_subject: LLM-id не найден, fallback={w0.get('path')!r}")
     except Exception as e:
         state.errors.append(f"category: {e}")
         logger.exception("match_category %s parse: %s", state.sku, e)

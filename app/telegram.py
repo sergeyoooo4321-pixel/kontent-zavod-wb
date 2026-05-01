@@ -140,22 +140,37 @@ class TelegramClient:
                 item["parse_mode"] = "Markdown"
             media.append(item)
         body = {"chat_id": chat_id, "media": media}
-        try:
-            r = await self._http.post(f"{self._url}/sendMediaGroup", json=body)
-            if r.status_code >= 400:
-                # Если Markdown сломался — повторим без parse_mode
-                if media[0].get("parse_mode"):
-                    media[0].pop("parse_mode", None)
-                    r = await self._http.post(f"{self._url}/sendMediaGroup", json=body)
-        except httpx.HTTPStatusError as e:
-            raise TelegramError(f"sendMediaGroup {e.response.status_code}") from None
-        if r.status_code >= 400:
-            logger.warning("sendMediaGroup %s: %s", r.status_code, r.text[:200])
-            # Фолбэк: отправить как простые ссылки текстом
-            text = "\n".join(f"• {u}" for u, _ in photos)
-            await self.send(chat_id, text, parse_mode=None)
-            return
-        logger.info("tg.media_group chat_id=%s count=%d", chat_id, len(media))
+        # До 3 попыток. WEBPAGE_MEDIA_EMPTY часто = Yandex S3 не успел пропагировать
+        # публичный доступ к свежему файлу — ждём 2 / 4 секунды и повторяем.
+        import asyncio
+        last_text = ""
+        for attempt in range(3):
+            try:
+                r = await self._http.post(f"{self._url}/sendMediaGroup", json=body)
+            except httpx.HTTPStatusError as e:
+                raise TelegramError(f"sendMediaGroup {e.response.status_code}") from None
+            if r.status_code < 400:
+                logger.info("tg.media_group chat_id=%s count=%d (attempt=%d)",
+                            chat_id, len(media), attempt + 1)
+                return
+            last_text = r.text[:200]
+            # Markdown проблема — снимаем parse_mode и пробуем ещё раз
+            if media[0].get("parse_mode") and "parse" in last_text.lower():
+                media[0].pop("parse_mode", None)
+                continue
+            # WEBPAGE_MEDIA_EMPTY — S3 ещё не пропагировался, ждём
+            if "WEBPAGE_MEDIA_EMPTY" in last_text or "wrong file identifier" in last_text.lower():
+                logger.warning("sendMediaGroup retry %d/3 (S3 propagation): %s",
+                               attempt + 1, last_text)
+                await asyncio.sleep(2 * (attempt + 1))
+                continue
+            # Другая ошибка — выходим
+            break
+
+        logger.warning("sendMediaGroup gave up: %s", last_text)
+        # Фолбэк: отправить как простые ссылки текстом
+        text = "\n".join(f"• {u}" for u, _ in photos)
+        await self.send(chat_id, text, parse_mode=None)
 
     async def send_with_buttons(
         self,
