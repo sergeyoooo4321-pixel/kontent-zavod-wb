@@ -347,12 +347,13 @@ def _filter_leaves_by_keywords(name: str, leaves: list[dict], top_n: int = 50) -
 
     Простой scoring: сколько слов из name (≥3 символов) содержатся в leaf.path.
     Возвращает top-N с ненулевым score; если все scores 0 — возвращает первые top-N.
-    Это резко сокращает prompt для LLM (1500 → 50) — gpt-5-2 перестаёт захлёбываться.
+    ВАЖНО: фильтруем leaves с пустым id — они нам бесполезны для подстановки CategoryRef.
     """
     import re
     words = {w.lower() for w in re.findall(r"[\wа-яА-ЯёЁ]{3,}", name)}
+    valid = [l for l in leaves if l.get("id")]  # только leaves с непустым id
     scored: list[tuple[int, dict]] = []
-    for leaf in leaves:
+    for leaf in valid:
         path = (leaf.get("path") or "").lower()
         score = sum(1 for w in words if w in path)
         scored.append((score, leaf))
@@ -360,7 +361,6 @@ def _filter_leaves_by_keywords(name: str, leaves: list[dict], top_n: int = 50) -
     nonzero = [l for s, l in scored if s > 0][:top_n]
     if nonzero:
         return nonzero
-    # ничего не подошло — берём первые top_n как кандидатов
     return [l for _, l in scored[:top_n]]
 
 
@@ -395,9 +395,9 @@ async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves
     if not resp:
         # Fallback: берём top-1 из keyword-match. Хоть какая-то категория лучше,
         # чем «не определена» (юзер потом сможет поправить в кабинете МП).
-        if ozon_short and wb_short:
-            o0 = ozon_short[0]
-            w0 = wb_short[0]
+        o0 = next((l for l in ozon_short if l.get("id")), None)
+        w0 = next((l for l in wb_short if l.get("id")), None)
+        if o0 and w0:
             state.ozon_category = CategoryRef(
                 id=int(o0["id"]), type_id=o0.get("type_id"), path=o0.get("path", ""), score=0.3,
             )
@@ -420,27 +420,29 @@ async def match_category(state: ProductState, ozon_leaves: list[dict], wb_leaves
         wb_id = int(resp.get("wb_id") or 0)
         score = float(resp.get("score") or 0.5)
         if ozon_id:
-            o = next((x for x in ozon_leaves if x["id"] == ozon_id), None)
+            o = next((x for x in ozon_leaves if x.get("id") == ozon_id), None)
             state.ozon_category = CategoryRef(
                 id=ozon_id, type_id=ozon_type_id or None,
                 path=(o or {}).get("path", ""), score=score,
             )
         if wb_id:
-            w = next((x for x in wb_leaves if x["id"] == wb_id), None)
+            w = next((x for x in wb_leaves if x.get("id") == wb_id), None)
             state.wb_subject = CategoryRef(
                 id=wb_id, path=(w or {}).get("path", ""), score=score,
             )
         # Если LLM вернул валидный JSON но ID-ы не нашлись — fallback на keyword-match
-        if not state.ozon_category and ozon_short:
-            o0 = ozon_short[0]
-            state.ozon_category = CategoryRef(
-                id=int(o0["id"]), type_id=o0.get("type_id"), path=o0.get("path", ""), score=0.3,
-            )
-            state.warnings.append(f"ozon_category: LLM-id не найден, fallback={o0.get('path')!r}")
-        if not state.wb_subject and wb_short:
-            w0 = wb_short[0]
-            state.wb_subject = CategoryRef(id=int(w0["id"]), path=w0.get("path", ""), score=0.3)
-            state.warnings.append(f"wb_subject: LLM-id не найден, fallback={w0.get('path')!r}")
+        if not state.ozon_category:
+            o0 = next((l for l in ozon_short if l.get("id")), None)
+            if o0:
+                state.ozon_category = CategoryRef(
+                    id=int(o0["id"]), type_id=o0.get("type_id"), path=o0.get("path", ""), score=0.3,
+                )
+                state.warnings.append(f"ozon_category: LLM-id не найден, fallback={o0.get('path')!r}")
+        if not state.wb_subject:
+            w0 = next((l for l in wb_short if l.get("id")), None)
+            if w0:
+                state.wb_subject = CategoryRef(id=int(w0["id"]), path=w0.get("path", ""), score=0.3)
+                state.warnings.append(f"wb_subject: LLM-id не найден, fallback={w0.get('path')!r}")
     except Exception as e:
         state.errors.append(f"category: {e}")
         logger.exception("match_category %s parse: %s", state.sku, e)
