@@ -428,7 +428,9 @@ class KieAIClient:
         пустой content, тогда gpt-4o-mini обычно работает.
         """
         primary = model or self._llm_model
-        fallback = self._llm_fallback_model if primary != self._llm_fallback_model else None
+        # Fallback может быть списком через запятую: «gpt-4o-mini,claude-haiku,deepseek-chat»
+        fallbacks_raw = self._llm_fallback_model or ""
+        fallbacks = [m.strip() for m in fallbacks_raw.split(",") if m.strip() and m.strip() != primary]
 
         async def _call_with_model(m: str, extra_user: str = "") -> str:
             url = f"{self._base}/{m}/v1/chat/completions"
@@ -470,14 +472,18 @@ class KieAIClient:
         except json.JSONDecodeError:
             pass
 
-        # Попытка 3: fallback-модель (если она другая)
-        if fallback:
-            logger.warning("chat_json: %s не отвечает валидным JSON, пробуем fallback %s",
-                           primary, fallback)
+        # Попытка 3+: фоллбэки по очереди
+        last_content = content
+        for fb in fallbacks:
+            logger.warning("chat_json: пробуем fallback модель %s", fb)
             try:
-                content = await _call_with_model(fallback)
-                return json.loads(_strip_json_markdown(content))
+                last_content = await _call_with_model(fb)
+                return json.loads(_strip_json_markdown(last_content))
             except (json.JSONDecodeError, httpx.HTTPError) as e:
-                logger.warning("chat_json fallback %s тоже фейл: %s", fallback, str(e)[:200])
+                logger.warning("chat_json fallback %s фейл: %s", fb, str(e)[:200])
+                continue
 
-        raise KieAIError(f"LLM returned non-JSON twice (primary={primary}, fallback={fallback}): {content[:300]}")
+        raise KieAIError(
+            f"LLM returned non-JSON по всем моделям (primary={primary}, "
+            f"fallbacks={fallbacks}): last={last_content[:300]}"
+        )

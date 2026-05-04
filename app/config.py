@@ -75,10 +75,11 @@ class Settings(BaseSettings):
     KIE_API_KEY: str
     KIE_IMAGE_MODEL: str = "gpt-image-2-image-to-image"
     KIE_LLM_MODEL: str = "gpt-5-2"
-    # Fallback модель для chat_json: если основная (gpt-5-2) не отвечает —
-    # пробуем эту. claude-haiku-4-5 / gpt-4o-mini / deepseek-chat — на выбор
-    # (зависит от того что доступно в твоём kie.ai-аккаунте).
-    KIE_LLM_FALLBACK_MODEL: str = "gpt-4o-mini"
+    # Fallback модели для chat_json через ЗАПЯТУЮ. Если основная (gpt-5-2)
+    # не отвечает — пробуем по очереди. Какая первая ответит валидным JSON —
+    # та и использована. Это покрывает kie.ai outage отдельных моделей.
+    # Доступные на kie.ai: gpt-4o-mini, claude-haiku-4-5, deepseek-chat, gemini-2.5-flash.
+    KIE_LLM_FALLBACK_MODEL: str = "gpt-4o-mini,claude-haiku-4-5,deepseek-chat,gemini-2.5-flash"
     KIE_POLL_INTERVAL_SEC: float = 5.0
     KIE_POLL_MAX_ATTEMPTS: int = 60
     # Лимит kie.ai: 20 createTask / 10 сек = 2 req/sec. Token-bucket throttle
