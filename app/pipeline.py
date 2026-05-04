@@ -502,11 +502,20 @@ class CategoryData:
 
 
 def dedup_categories(states: list[ProductState]) -> set[tuple[int, int | None, int]]:
-    """Возвращает уникальные пары (ozon_id, ozon_type_id, wb_id) для дедупа."""
+    """Возвращает уникальные пары (ozon_id, ozon_type_id, wb_id) для дедупа.
+
+    Если у товара только одна сторона (только-WB или только-Ozon кабинет) —
+    отсутствующая сторона представляется как 0/None, чтобы load_category_data
+    их пропустил по своим settings.has_*_creds проверкам.
+    """
     out: set[tuple[int, int | None, int]] = set()
     for s in states:
-        if s.ozon_category and s.wb_subject:
-            out.add((s.ozon_category.id, s.ozon_category.type_id, s.wb_subject.id))
+        if not (s.ozon_category or s.wb_subject):
+            continue
+        oz_id = s.ozon_category.id if s.ozon_category else 0
+        oz_type = s.ozon_category.type_id if s.ozon_category else None
+        wb_id = s.wb_subject.id if s.wb_subject else 0
+        out.add((oz_id, oz_type, wb_id))
     return out
 
 
@@ -515,7 +524,8 @@ async def load_category_data(
 ) -> CategoryData:
     ozon_attrs = []
     ozon_vals: dict[int, list[dict]] = {}
-    if settings.has_ozon_creds and ozon_type_id:
+    # ozon_id=0 значит товар только-WB (Ozon стороны нет) — пропускаем
+    if settings.has_ozon_creds and ozon_id and ozon_type_id:
         ozon_attrs = await deps.ozon.category_attributes(ozon_id, ozon_type_id)
         # V8 — параллельная подгрузка значений для всех атрибутов с dictionary_id
         attrs_with_dict = [a for a in ozon_attrs if a.get("dictionary_id")]
@@ -534,7 +544,7 @@ async def load_category_data(
 
     wb_charcs = []
     wb_vals: dict[int, list[dict]] = {}
-    if settings.has_wb_creds:
+    if settings.has_wb_creds and wb_id:
         wb_charcs = await deps.wb.subject_charcs(wb_id)
         for c in wb_charcs:
             dname = c.get("dictionary") or c.get("source")
@@ -556,8 +566,10 @@ async def build_skus_and_texts(
     cat_data: dict[tuple, CategoryData],
     deps: Deps,
 ) -> None:
-    if not state.ozon_category or not state.wb_subject:
-        state.errors.append("titles: no category")
+    # Достаточно ХОТЯ БЫ одной стороны (только-WB кабинет = ozon_category может
+    # быть None и это норм; pipeline не будет звать Ozon API).
+    if not state.ozon_category and not state.wb_subject:
+        state.errors.append("titles: no category (ни ozon, ни wb)")
         return
 
     # 1. расширение до 3 SKU (C7 — реальные размеры/вес если переданы юзером)
@@ -569,7 +581,11 @@ async def build_skus_and_texts(
         dims_from_internet=True,  # +1 см подстраховка
     )
 
-    cat_key = (state.ozon_category.id, state.ozon_category.type_id, state.wb_subject.id)
+    cat_key = (
+        state.ozon_category.id if state.ozon_category else 0,
+        state.ozon_category.type_id if state.ozon_category else None,
+        state.wb_subject.id if state.wb_subject else 0,
+    )
     cat = cat_data.get(cat_key)
 
     # Парсим исходное название один раз — используется для детерминированных форматтеров
@@ -584,7 +600,8 @@ async def build_skus_and_texts(
     try:
         sys_t, usr_t = build_titles_prompts_batch(
             state.name, state.brand,
-            state.ozon_category.path, state.wb_subject.path,
+            state.ozon_category.path if state.ozon_category else "—",
+            state.wb_subject.path if state.wb_subject else "—",
             qtys,
         )
         txt_batch = await deps.kie.chat_json(system=sys_t, user=usr_t)
@@ -1065,20 +1082,47 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
         ok_imgs = sum(1 for s in states if len(s.images) == 4)
         await deps.tg.send(req.chat_id, f"📸 Фото: {ok_imgs}/{len(states)} товаров полностью готовы")
 
-        # Этап 2: категории
-        if settings.has_ozon_creds and settings.has_wb_creds:
-            try:
-                ozon_tree = await deps.ozon.category_tree()
-                wb_tree = await deps.wb.subjects_tree()
-                ozon_leaves = _flatten_tree(ozon_tree, is_ozon=True)
-                wb_leaves = _flatten_tree(wb_tree, is_ozon=False)
-                await asyncio.gather(*[match_category(s, ozon_leaves, wb_leaves, deps) for s in states])
-                await deps.tg.send(req.chat_id, "📂 Категории определены")
-            except (OzonError, WBError) as e:
-                await deps.tg.send(req.chat_id, f"⚠️ Категории: {e}")
-        else:
+        # Какие стороны нужны исходя из target-кабинетов (а не всех настроенных)
+        targets_preview: list[Cabinet] = []
+        for nm in (req.cabinet_names or []):
+            tc = settings.get_cabinet(nm)
+            if tc:
+                targets_preview.append(tc)
+        # Если cabinet_names не указан — fallback на default-кабинет
+        if not targets_preview:
+            dn = settings.default_cabinet_name
+            if dn:
+                tc = settings.get_cabinet(dn)
+                if tc:
+                    targets_preview.append(tc)
+        need_ozon = any(c.has_ozon for c in targets_preview)
+        need_wb = any(c.has_wb for c in targets_preview)
+        if not (need_ozon or need_wb):
             await deps.tg.send(req.chat_id, "⚠️ Ozon/WB ключи не заданы — пропускаю этапы 2-4. Фото залиты в S3.")
             return
+
+        # Этап 2: категории — каждая сторона грузится независимо
+        ozon_leaves: list[dict] = []
+        wb_leaves: list[dict] = []
+        if need_ozon:
+            try:
+                ozon_tree = await deps.ozon.category_tree()
+                ozon_leaves = _flatten_tree(ozon_tree, is_ozon=True)
+            except OzonError as e:
+                await deps.tg.send(req.chat_id, f"⚠️ Ozon категории: {e}")
+                logger.warning("ozon category_tree fail: %s", e)
+        if need_wb:
+            try:
+                wb_tree = await deps.wb.subjects_tree()
+                wb_leaves = _flatten_tree(wb_tree, is_ozon=False)
+            except WBError as e:
+                await deps.tg.send(req.chat_id, f"⚠️ WB субъекты: {e}")
+                logger.warning("wb subjects_tree fail: %s", e)
+        if not ozon_leaves and not wb_leaves:
+            await deps.tg.send(req.chat_id, "⚠️ Не удалось получить категории ни с Ozon, ни с WB. Этап заливки будет с ошибками.")
+        else:
+            await asyncio.gather(*[match_category(s, ozon_leaves, wb_leaves, deps) for s in states])
+            await deps.tg.send(req.chat_id, "📂 Категории определены")
 
         # Этап 3: справочники + шаблоны (per-category)
         unique_cats = dedup_categories(states)
