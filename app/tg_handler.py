@@ -65,6 +65,7 @@ def _reset_partial(chat_id: int) -> TgSession:
 
 # Канон названий кнопок — собраны в одном месте чтобы не разъезжалось
 BTN_NEW_BATCH = "📦 Новая партия"
+BTN_GNOME = "🎨 Гном-генерация"
 BTN_CABINET_PREFIX = "🏪 Кабинет:"  # динамический суффикс
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_HELP = "ℹ️ Помощь"
@@ -74,6 +75,7 @@ BTN_RESET = "🔄 Сбросить партию"
 BTN_RUN = "▶️ Запустить генерацию"
 BTN_CONFIRM_BACK = "◀️ Назад к названиям"
 BTN_CABINET_ALL = "🔄 Все сразу (mirror)"
+BTN_GNOME_RESET = "🧙 Очистить разговор с гномом"
 
 CABINET_DETAILS = {
     "profit": "Профит",
@@ -120,9 +122,16 @@ def _kb(rows: list[list[str]]) -> dict:
 
 def _kb_main(s: TgSession) -> dict:
     return _kb([
-        [BTN_NEW_BATCH],
+        [BTN_NEW_BATCH, BTN_GNOME],
         [_btn_cabinet_top(s)],
         [BTN_SETTINGS, BTN_HELP],
+    ])
+
+
+def _kb_gnome() -> dict:
+    return _kb([
+        [BTN_GNOME_RESET],
+        [BTN_BACK],
     ])
 
 
@@ -240,30 +249,62 @@ async def _show_main_menu(deps, chat_id: int, s: TgSession) -> None:
 # ─── мост к гному (cz-gnome.service на :8001) ─────────────────────
 
 
-_GNOME_URL = "http://127.0.0.1:8001/chat"
+_GNOME_URL = "http://127.0.0.1:8001"
 
 
-async def _ask_gnome(deps, chat_id: int, text: str) -> str:
-    """Шлёт сообщение в cz-gnome.service и возвращает его ответ.
+async def _ask_gnome(
+    deps,
+    chat_id: int,
+    text: str,
+    images: list[str] | None = None,
+) -> tuple[str, bool]:
+    """Шлёт сообщение в cz-gnome.service и возвращает (reply, approval_required).
 
     Гном живёт в ../gnome/ как отдельный сервис на :8001. Сессии у него
-    per chat_id, так что юзерская нить разговора сохраняется между
-    сообщениями автоматически.
+    per chat_id — нить разговора сохраняется автоматически.
+    Если в reply есть approval-маркер — возвращаем флаг True, чтобы bridge
+    нарисовал inline-кнопки [✅ Одобряю] [❌ Перегенерить].
     """
     try:
         r = await deps.http.post(
-            _GNOME_URL,
-            json={"chat_id": chat_id, "text": text},
-            timeout=120.0,
+            f"{_GNOME_URL}/chat",
+            json={"chat_id": chat_id, "text": text, "images": images or []},
+            timeout=300.0,
         )
         if r.status_code >= 400:
             logger.warning("gnome %s: %s", r.status_code, r.text[:200])
-            return f"🧙 Гном задумался: HTTP {r.status_code}"
+            return f"🧙 Гном задумался: HTTP {r.status_code}", False
         data = r.json()
-        return (data.get("reply") or "").strip() or "🧙 Гном промолчал."
+        reply = (data.get("reply") or "").strip() or "🧙 Гном промолчал."
+        return reply, bool(data.get("approval_required"))
     except Exception as e:
         logger.warning("gnome bridge fail chat=%s: %s", chat_id, e)
-        return f"🧙 Гном недоступен: {str(e)[:120]}"
+        return f"🧙 Гном недоступен: {str(e)[:120]}", False
+
+
+async def _gnome_reset(deps, chat_id: int) -> bool:
+    try:
+        r = await deps.http.post(f"{_GNOME_URL}/sessions/{chat_id}/reset", timeout=10.0)
+        return r.status_code < 400
+    except Exception as e:
+        logger.warning("gnome reset fail: %s", e)
+        return False
+
+
+async def _send_gnome_reply(deps, chat_id: int, reply: str, approval: bool, kb: dict) -> None:
+    """Отправить ответ гнома: либо обычный текст, либо с approval-кнопками."""
+    if approval:
+        await deps.tg.send_with_buttons(
+            chat_id,
+            reply,
+            [[
+                {"text": "✅ Одобряю", "callback_data": "gnome:approve:yes"},
+                {"text": "❌ Перегенерить", "callback_data": "gnome:approve:no"},
+            ]],
+            parse_mode=None,
+        )
+    else:
+        await _send(deps, chat_id, reply, kb=kb, parse_mode=None)
 
 
 async def _show_cabinet_menu(deps, chat_id: int) -> None:
@@ -313,8 +354,9 @@ def _help_text() -> str:
         "Безопасно тестить без публикации товаров.\n\n"
         "*◀️ Назад в меню* — возвращает в главное меню в любой момент.\n"
         "*🔄 Сбросить партию* — чистит все фото и названия (кабинет сохраняется).\n\n"
-        "*🧙 Гномик* — в главном меню (когда не идёт партия) пиши обычный текст и я отвечу. "
-        "Знаю про маркетплейсы, помогаю разобраться, помню наш разговор.\n\n"
+        "*🧙 Гномик* — в главном меню пиши обычный текст или жми *🎨 Гном-генерация*. "
+        "В режиме гнома кидаешь фото + бренд/название — он генерит варианты упаковки, "
+        "спрашивает одобрения и собирает карточку. Помнит весь разговор.\n\n"
         "Команды: `/start` `/help`"
     )
 
@@ -331,7 +373,25 @@ async def handle_update(update: dict, deps) -> None:
     cq = update.get("callback_query")
     if cq:
         chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
-        logger.info("tg.update callback_query chat=%s data=%s", chat_id, cq.get("data"))
+        cq_data = cq.get("data") or ""
+        logger.info("tg.update callback_query chat=%s data=%s", chat_id, cq_data)
+        # gnome:approve:yes / gnome:approve:no
+        if cq_data.startswith("gnome:approve:") and chat_id:
+            try:
+                await deps.tg.answer_callback_query(cq.get("id") or "")
+            except Exception:
+                pass
+            answer = cq_data.split(":", 2)[-1]
+            user_text = "✅ Одобряю, продолжай" if answer == "yes" else "❌ Не нравится, перегенери"
+            try:
+                await deps.tg.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            reply, approval = await _ask_gnome(deps, chat_id, user_text)
+            s = _get_session(chat_id)
+            kb = _kb_gnome() if s.phase == "gnome_chat" else _kb_main(s)
+            await _send_gnome_reply(deps, chat_id, reply, approval, kb)
+            return
         await _handle_legacy_callback(cq, deps)
         return
     msg = update.get("message")
@@ -443,14 +503,25 @@ async def _handle_message(msg: dict, deps) -> None:
             s.phase = "settings"
             await _show_settings(deps, chat_id, s)
             return
+        # «🎨 Гном-генерация» — переключаемся в чат с гномом
+        if text == BTN_GNOME:
+            s.phase = "gnome_chat"
+            await _send(deps, chat_id,
+                "🎨 *Режим Гнома.*\n\n"
+                "Кидай фото товара и пиши что это (бренд, артикул, название). "
+                "Я сгенерирую варианты упаковки, спрошу одобрения, потом "
+                "соберу карточку.\n\n"
+                "Можешь и просто болтать — я помню разговор.",
+                kb=_kb_gnome())
+            return
         # любой произвольный текст в idle — переадресуем гному
         if text and not text.startswith("/"):
             try:
                 await deps.tg.send_chat_action(chat_id, "typing")
             except Exception:
                 pass
-            reply = await _ask_gnome(deps, chat_id, text)
-            await _send(deps, chat_id, reply, kb=_kb_main(s), parse_mode=None)
+            reply, approval = await _ask_gnome(deps, chat_id, text)
+            await _send_gnome_reply(deps, chat_id, reply, approval, _kb_main(s))
             return
         # фото или иной не-текст — показать меню
         await _show_main_menu(deps, chat_id, s)
@@ -585,6 +656,60 @@ async def _handle_message(msg: dict, deps) -> None:
             "⏳ Партия уже идёт. Жди отчёт. /reset отменит сессию "
             "(но не остановит уже запущенный пайплайн).",
             kb=_kb_running())
+        return
+
+    if s.phase == "gnome_chat":
+        # Очистить разговор с гномом
+        if text == BTN_GNOME_RESET:
+            await _gnome_reset(deps, chat_id)
+            await _send(deps, chat_id, "🧙 Очистил историю. Начнём заново.", kb=_kb_gnome())
+            return
+
+        # Фото в режиме гнома: качаем → S3 → URL → гному с vision
+        if has_image:
+            try:
+                await deps.tg.send_chat_action(chat_id, "upload_photo")
+            except Exception:
+                pass
+            try:
+                raw = await deps.tg.get_file_bytes(image_file_id)
+            except Exception as e:
+                await _send(deps, chat_id, f"Не смог скачать фото из TG: {e}", kb=_kb_gnome())
+                return
+            try:
+                from .s3 import S3Client
+                key = f"gnome-{chat_id}/{int(time.time())}-{uuid.uuid4().hex[:6]}.jpg"
+                src_url = await deps.s3.put_public(key, raw, "image/jpeg")
+            except Exception as e:
+                await _send(deps, chat_id, f"S3 не принял фото: {e}", kb=_kb_gnome())
+                return
+
+            caption = text or ""
+            await _send(deps, chat_id,
+                "📥 Принял фото. Передаю гному…",
+                kb=_kb_gnome(), parse_mode=None)
+            try:
+                await deps.tg.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            reply, approval = await _ask_gnome(deps, chat_id, caption, images=[src_url])
+            await _send_gnome_reply(deps, chat_id, reply, approval, _kb_gnome())
+            return
+
+        # Чистый текст в режиме гнома
+        if text:
+            try:
+                await deps.tg.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            reply, approval = await _ask_gnome(deps, chat_id, text)
+            await _send_gnome_reply(deps, chat_id, reply, approval, _kb_gnome())
+            return
+
+        # Что-то странное (например стикер) — показать инструкцию
+        await _send(deps, chat_id,
+            "🧙 В режиме гнома — кидай фото или пиши текстом.",
+            kb=_kb_gnome())
         return
 
 

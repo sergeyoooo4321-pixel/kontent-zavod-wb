@@ -13,6 +13,11 @@ from .tools import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+# Маркер для approval-flow. Если скилл с requires_approval=true вернул результат —
+# tool-loop завершается, а в reply дописывается этот маркер. Bridge парсит и
+# рисует inline-кнопки [✅ Одобряю] [❌ Перегенерить].
+APPROVAL_MARKER = "[APPROVAL_REQUIRED]"
+
 
 @dataclass
 class ToolCtx:
@@ -43,9 +48,9 @@ class QueryEngine:
             tools_section = "\n".join(
                 f"- `{t.name}`: {t.description}" for t in self._registry.all()
             )
+            workspace_dir = self._cfg.claude_md.parent
             self._system_cache = memory.build_system_prompt(
-                claude_md=self._cfg.claude_md,
-                memory_dir=self._cfg.memory_dir,
+                workspace_dir=workspace_dir,
                 tools_section=tools_section,
             )
         return self._system_cache
@@ -53,14 +58,21 @@ class QueryEngine:
     def reload_memory(self) -> None:
         self._system_cache = None
 
-    async def query(self, chat_id: int, user_text: str) -> str:
+    async def query(self, chat_id: int, user_text: str, images: list[str] | None = None) -> str:
         lock = self._sessions.lock_for(chat_id)
         async with lock:
-            return await self._query_locked(chat_id, user_text)
+            return await self._query_locked(chat_id, user_text, images=images or [])
 
-    async def _query_locked(self, chat_id: int, user_text: str) -> str:
+    async def _query_locked(self, chat_id: int, user_text: str, images: list[str]) -> str:
         sess = self._sessions.load(chat_id)
-        sess.messages.append({"role": "user", "content": user_text})
+        # Vision: если есть картинки, формируем content как list (Gemini-стиль)
+        if images:
+            content = [{"type": "text", "text": user_text}] if user_text else []
+            for url in images:
+                content.append({"type": "image_url", "image_url": {"url": url}})
+            sess.messages.append({"role": "user", "content": content})
+        else:
+            sess.messages.append({"role": "user", "content": user_text})
 
         if compact.should_compact(sess.messages, cap=self._cfg.COMPACT_AT_TOKENS):
             try:
@@ -115,6 +127,7 @@ class QueryEngine:
                 return (msg.get("content") or "").strip() or "[пустой ответ]"
 
             # Выполнить все tool_calls и добавить tool-результаты в историю
+            approval_needed = False
             for call in tool_calls:
                 fn = call.get("function") or {}
                 name = fn.get("name") or ""
@@ -131,12 +144,38 @@ class QueryEngine:
                     except Exception as e:
                         logger.exception("tool %s failed", name)
                         result = {"ok": False, "error": str(e)}
+                    # Если у tool помечено requires_approval — после его
+                    # выполнения мы не идём в следующий шаг loop, а просим
+                    # ассистента сформировать reply с маркером.
+                    if getattr(tool, "requires_approval", False):
+                        approval_needed = True
                 sess.messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id"),
                     "name": name,
                     "content": json.dumps(result, ensure_ascii=False)[:8000],
                 })
+
+            if approval_needed:
+                # Делаем ОДИН финальный вызов LLM чтобы он сформулировал
+                # reply юзеру с отчётом + вопросом «одобряешь?»
+                try:
+                    msg = await self._llm.chat(
+                        model=self._cfg.LLM_MODEL,
+                        system=system + "\n\nВАЖНО: только что отработал скилл с "
+                                        "approval-флагом. Покажи юзеру результат и "
+                                        "явно спроси одобрения. НЕ вызывай больше tools.",
+                        messages=sess.messages,
+                        tools=None,
+                        temperature=0.2,
+                    )
+                    sess.messages.append(_clean_assistant(msg))
+                    self._sessions.save(sess)
+                    text = (msg.get("content") or "").strip() or "Одобряешь?"
+                    return f"{text}\n\n{APPROVAL_MARKER}"
+                except LLMError as e:
+                    self._sessions.save(sess)
+                    return f"[ошибка финализации approval]: {e}\n\n{APPROVAL_MARKER}"
 
         self._sessions.save(sess)
         return "[предел шагов tool-loop, остановился]"

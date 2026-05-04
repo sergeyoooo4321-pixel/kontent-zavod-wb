@@ -54,6 +54,7 @@ class _SkillTool(Tool):
         self._meta = meta
         self._run = run
         self._dir = skill_dir
+        self.requires_approval = bool(meta.get("requires_approval", False))
 
     @property
     def name(self) -> str:

@@ -26,12 +26,14 @@ logger = logging.getLogger("gnome")
 
 class ChatIn(BaseModel):
     chat_id: int
-    text: str
+    text: str = ""
+    images: list[str] = []  # публичные URL картинок (S3 / любой http)
 
 
 class ChatOut(BaseModel):
     chat_id: int
     reply: str
+    approval_required: bool = False
 
 
 @asynccontextmanager
@@ -77,8 +79,12 @@ async def chat(req: ChatIn):
     if not settings.KIE_API_KEY:
         raise HTTPException(status_code=503, detail="KIE_API_KEY не задан в .env")
     engine: QueryEngine = app.state.engine
-    reply = await engine.query(req.chat_id, req.text)
-    return ChatOut(chat_id=req.chat_id, reply=reply)
+    reply = await engine.query(req.chat_id, req.text, images=req.images)
+    from .agent import APPROVAL_MARKER
+    approval = APPROVAL_MARKER in reply
+    if approval:
+        reply = reply.replace(APPROVAL_MARKER, "").strip()
+    return ChatOut(chat_id=req.chat_id, reply=reply, approval_required=approval)
 
 
 @app.get("/sessions")

@@ -1,0 +1,35 @@
+# Профиль воркспейса гнома. Загружается на старте сервиса.
+# Идея взята у openclaw — workspace = личное пространство агента
+# с его памятью, скиллами и настройками.
+
+name: kontent-zavod-gnome
+owner: продавец-сеточник на маркетплейсах WB/Ozon
+purpose: |
+  Помощник внутри Telegram-бота «Контент-завод».
+  Под управлением гнома — генерация фото товара (kie gpt-image-2),
+  подбор категории, заполнение и заливка карточки на WB/Ozon.
+  Работает в режиме approval: каждый ключевой шаг согласует с юзером.
+
+# Дефолтная LLM. Можно переопределить через env LLM_MODEL.
+default_model: gemini-3-pro
+fallback_model: gpt-5-2
+
+# Whitelisted скиллы — чтобы случайно не подцепить чужой код в skills/
+allowed_skills:
+  - generate_image
+  - match_category
+  - fill_card
+
+# Backend cz-backend.service на :8000 — тот же сервер.
+# Гном дёргает internal API оттуда (kie-клиент, S3, WB, Ozon уже подняты в нём).
+backend:
+  url: http://127.0.0.1:8000
+  internal_token_env: INTERNAL_TOKEN  # читаем из env
+
+# Файлы которые читаются в системный промпт при первом запросе сессии.
+# Порядок важен: BOOTSTRAP — самое первое, дальше идентичность, дальше детали.
+bootstrap:
+  - BOOTSTRAP.md
+  - CLAUDE.md
+  - memory/identity.md
+  - memory/about_marketplaces.md

@@ -1,0 +1,22 @@
+name: fill_card
+description: |
+  Собрать payload карточки товара (артикул, название, фото, бренд, кабинет).
+  По умолчанию dry_run=true — payload только возвращается, на МП ничего не
+  публикуется. Для реальной публикации юзер должен явно одобрить и переключить
+  dry_run в false. Скилл помечен requires_approval — после вызова обязательно
+  покажи payload юзеру и попроси согласия.
+version: 0.1.0
+input_schema:
+  type: object
+  properties:
+    sku: { type: string }
+    brand: { type: string }
+    name: { type: string }
+    images:
+      type: object
+      description: "Tag → URL, например {main: 'https://...', pack2: '...', ...}"
+    cabinet: { type: string, description: "Имя кабинета или null = default" }
+    dry_run: { type: boolean, default: true }
+  required: [sku, name, images]
+permissions: []
+requires_approval: true

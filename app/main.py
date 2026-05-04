@@ -11,6 +11,7 @@ from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, status
 from fastapi import Request
 
 from .config import settings
+from .internal_api import router as internal_router
 from .kie_ai import KieAIClient
 from .models import RunRequest, RunResponse
 from .ozon import OzonClient
@@ -90,6 +91,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Контент завод backend", version="1.0.0", lifespan=lifespan)
+app.include_router(internal_router)
 
 
 @app.get("/healthz")

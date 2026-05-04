@@ -1,0 +1,16 @@
+name: match_category
+description: |
+  Подобрать категорию товара на Wildberries и Ozon по названию и бренду.
+  На текущем MVP-этапе возвращает справочную пометку — для полного матчинга
+  с категорийными справочниками используй кнопку «📦 Новая партия» в боте.
+version: 0.1.0
+input_schema:
+  type: object
+  properties:
+    name: { type: string }
+    brand: { type: string }
+    main_image_url: { type: string, description: "URL утверждённого main-фото" }
+    side: { type: string, enum: [ozon, wb, both], default: both }
+  required: [name]
+permissions: []
+requires_approval: false

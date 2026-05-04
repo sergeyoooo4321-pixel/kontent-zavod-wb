@@ -58,10 +58,22 @@ python deploy_gnome.py    # из родительской папки (Новая
 
 Скрипт делает: `git pull` → создаёт venv `.venv-gnome` → `pip install` → копирует systemd-юнит → restart `cz-gnome.service` → проверяет healthz.
 
-## Этап 2 (TODO)
+## Этап 2 (готово)
 
-- Реальные скиллы: `generate_card`, `analyze_photo`, `upload_to_wb`, `read_logs`, `update_settings`.
-- Vision-input в `/chat` (image_url в content).
-- Telegram-bridge с собственным ботом (новый токен).
-- Approval-flow для опасных действий (заливка, удаление).
-- MCP-подключение, если будут сторонние серверы.
+- ✅ Workspace: `workspace.yaml` + `BOOTSTRAP.md` + расширенные `CLAUDE.md` / `memory/`.
+- ✅ Vision-input: `/chat` принимает `images: list[str]` (URLs).
+- ✅ TG-bridge через существующий бот (кнопка «🎨 Гном-генерация» + фаза `gnome_chat`).
+- ✅ 3 скилла под МП: `generate_image`, `match_category`, `fill_card` (обёртки над cz-backend `/internal/*`).
+- ✅ Approval-flow: маркер `[APPROVAL_REQUIRED]` + inline-кнопки `✅ Одобряю / ❌ Перегенерить`.
+
+## Этап 3 (TODO)
+
+- Полный категорийный матчинг через гнома (сейчас MVP).
+- Реальная заливка через `fill_card(dry_run=false)` (сейчас только payload).
+- Slash-команды `/compact /clear /skills /map`.
+- Sub-agents для долгих фоновых задач.
+- Self-check / heartbeat.
+
+## Источники архитектуры
+
+См. [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) — взято от openclaude (MIT) и openclaw (MIT).

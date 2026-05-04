@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     MAX_STEPS: int = 10
     LOG_LEVEL: str = "INFO"
 
+    # Для скиллов которые ходят в cz-backend internal API
+    BACKEND_URL: str = "http://127.0.0.1:8000"
+    INTERNAL_TOKEN: str = ""
+
     @property
     def data_dir(self) -> Path:
         d = GNOME_DIR / "data"
