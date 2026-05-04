@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import httpx
 from tenacity import (
@@ -20,6 +21,11 @@ class WBError(Exception):
 
 
 class WBClient:
+    # Кеш subjects_tree — он редко меняется, тяжёлый запрос (8 страниц по 1000)
+    _subjects_cache: list[dict] | None = None
+    _subjects_cache_at: float = 0.0
+    _subjects_cache_ttl: float = 3600.0  # 1 час
+
     def __init__(self, *, base: str, token: str | None, http: httpx.AsyncClient):
         self._base = base.rstrip("/")
         self._token = token
@@ -42,15 +48,28 @@ class WBClient:
         reraise=True,
     )
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        r = await self._http.get(
-            f"{self._base}{path}",
-            headers=self._headers,
-            params=params,
-            timeout=60.0,
-        )
-        if r.status_code >= 400:
-            raise WBError(f"GET {path}: {r.status_code} {r.text[:300]}")
-        return r.json()
+        # Доп. retry на 429 (WB global limiter per seller)
+        for attempt in range(5):
+            r = await self._http.get(
+                f"{self._base}{path}",
+                headers=self._headers,
+                params=params,
+                timeout=60.0,
+            )
+            if r.status_code == 429:
+                ra = 5.0
+                try:
+                    ra = float(r.headers.get("Retry-After") or 5)
+                except ValueError:
+                    pass
+                wait = min(max(ra, 5.0 * (2 ** attempt)), 60.0)
+                logger.warning("WB 429 GET %s, wait=%.1fs attempt=%d/5", path, wait, attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code >= 400:
+                raise WBError(f"GET {path}: {r.status_code} {r.text[:300]}")
+            return r.json()
+        raise WBError(f"GET {path}: 429 после 5 попыток")
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPError),
@@ -72,18 +91,26 @@ class WBClient:
     # ─── категории/предметы ─────────────────────────────────
 
     async def subjects_tree(self, locale: str = "ru") -> list[dict]:
-        """GET /content/v2/object/all — все листовые subjects (предметы).
+        """GET /content/v2/object/all — все subjects (предметы) с in-memory кешем.
 
-        WB API в v2 разделяет: /object/parent/all возвращает ~80 родительских
-        групп БЕЗ subjectID (это для UI-фильтров), а /object/all — реальные
-        subjects (~4000+) с настоящими subjectID, которые нужны для cards/upload.
-
-        Пагинируем по 1000, пока не получим меньше limit (значит конец).
+        Кеш: 1 час. Subjects редко меняются, а тяжёлый запрос (8 страниц по 1000)
+        провоцирует WB global limiter «too many requests per seller».
+        Между страницами throttle 1.5 сек.
         """
+        now = time.monotonic()
+        if (
+            WBClient._subjects_cache is not None
+            and (now - WBClient._subjects_cache_at) < WBClient._subjects_cache_ttl
+        ):
+            logger.info("WB subjects_tree: %d cached", len(WBClient._subjects_cache))
+            return WBClient._subjects_cache
+
         out: list[dict] = []
         limit = 1000
         offset = 0
-        for _ in range(20):  # safety: max 20k subjects
+        for page in range(20):  # safety: max 20k subjects
+            if page > 0:
+                await asyncio.sleep(1.5)  # throttle between pages
             data = await self._get("/content/v2/object/all",
                                    {"locale": locale, "limit": limit, "offset": offset})
             chunk = data.get("data") or []
@@ -93,7 +120,9 @@ class WBClient:
             if len(chunk) < limit:
                 break
             offset += limit
-        logger.info("WB subjects_tree: %d total subjects", len(out))
+        WBClient._subjects_cache = out
+        WBClient._subjects_cache_at = time.monotonic()
+        logger.info("WB subjects_tree: %d total subjects (fresh)", len(out))
         return out
 
     async def subject_charcs(self, subject_id: int, locale: str = "ru") -> list[dict]:
