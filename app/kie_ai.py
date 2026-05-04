@@ -40,6 +40,19 @@ class KieAITimeout(KieAIError):
     pass
 
 
+# Модели на kie.ai с эндпоинтом /codex/v1/responses (OpenAI Responses API).
+# https://docs.kie.ai/market/chat/gpt-5-4 — body имеет поле `input`, не `messages`,
+# response — output[].content[].text. Нет `response_format`, поэтому JSON просим
+# через инструкцию в input.
+_RESPONSES_API_MODELS = {"gpt-5-4", "codex"}
+
+
+def _is_responses_api(model: str) -> bool:
+    """Возвращает True если модель использует /codex/v1/responses вместо chat/completions."""
+    m = (model or "").lower()
+    return any(m == k or m.startswith(k + "-") for k in _RESPONSES_API_MODELS)
+
+
 def _strip_json_markdown(content: str) -> str:
     """Убирает markdown-обёртку ```json ... ``` если модель её добавила."""
     s = content.strip()
@@ -405,12 +418,12 @@ class KieAIClient:
         temperature: float = 0.4,
         max_tokens: int | None = None,
     ) -> dict:
-        """OpenAI-совместимый vision chat (text + image_url).
-
-        Используется для анализа фото товара и генерации JSON-дизайн-брифа.
-        Применяет robust JSON extraction (_extract_json) и до 5 попыток.
-        """
+        """Vision chat с robust JSON extraction. Авто-выбор endpoint по модели."""
         m = model or self._llm_model
+        if _is_responses_api(m):
+            return await self._chat_json_responses_api(
+                system=system, user=user, model=m, image_url=image_url,
+            )
         url = f"{self._base}/{m}/v1/chat/completions"
 
         last_content = ""
@@ -471,6 +484,70 @@ class KieAIClient:
 
         raise KieAIError(f"vision LLM returned non-JSON после 5 попыток: {last_content[:300]}")
 
+    async def _chat_json_responses_api(
+        self, *, system: str, user: str, model: str,
+        image_url: str | None = None, max_attempts: int = 5,
+    ) -> dict:
+        """Responses API endpoint /codex/v1/responses (gpt-5-4 и аналоги).
+
+        Body: {model, input:[...], reasoning:{effort}}, response — output[].content[].text.
+        JSON-mode нет — просим JSON через инструкцию.
+        Поддерживает vision: вместо `input_text` используется `input_image` с image_url.
+        """
+        url = f"{self._base}/codex/v1/responses"
+        last_content = ""
+        for attempt in range(max_attempts):
+            user_extra = ""
+            if attempt >= 1:
+                user_extra = (
+                    "\n\nЖЁСТКОЕ ТРЕБОВАНИЕ: ответь ТОЛЬКО валидным JSON-объектом, "
+                    "без преамбул и markdown."
+                )
+            sys_extra = "\n\nВажно: ответ — ТОЛЬКО валидный JSON-объект."
+            user_content: list[dict] = [
+                {"type": "input_text", "text": user + user_extra},
+            ]
+            if image_url:
+                user_content.append({"type": "input_image", "image_url": image_url})
+            body: dict[str, Any] = {
+                "model": model,
+                "stream": False,
+                "input": [
+                    {"role": "system", "content": [{"type": "input_text", "text": system + sys_extra}]},
+                    {"role": "user", "content": user_content},
+                ],
+                "reasoning": {"effort": "low"},
+            }
+            try:
+                r = await self._http.post(url, headers=self._headers, json=body, timeout=180.0)
+                r.raise_for_status()
+                data = r.json()
+                biz_code = data.get("code")
+                if biz_code is not None and biz_code != 200 and "output" not in data:
+                    raise KieAIError(
+                        f"kie.ai biz error code={biz_code} msg={data.get('msg')!r} model={model!r}"
+                    )
+                # Извлекаем text из output[].content[]
+                out = data.get("output") or []
+                last_content = ""
+                for item in out:
+                    if item.get("type") == "message":
+                        for c in (item.get("content") or []):
+                            if c.get("type") in ("output_text", "text"):
+                                last_content += c.get("text") or ""
+            except KieAIError:
+                raise
+            except httpx.HTTPError as e:
+                logger.warning("responses_api attempt %d/%d HTTP error: %s",
+                               attempt + 1, max_attempts, str(e)[:200])
+                continue
+            obj = _extract_json(last_content)
+            if obj is not None:
+                return obj
+            logger.warning("responses_api attempt %d/%d: non-JSON content=%r",
+                           attempt + 1, max_attempts, last_content[:150])
+        raise KieAIError(f"LLM (Responses API) non-JSON после {max_attempts} попыток (model={model}): {last_content[:300]}")
+
     @retry(
         retry=retry_if_exception_type(httpx.HTTPError),
         stop=stop_after_attempt(3),
@@ -486,19 +563,13 @@ class KieAIClient:
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> dict:
-        """OpenAI-совместимый chat/completions с robust JSON extraction.
-
-        Стратегия — 5 попыток:
-          1. с response_format=json_object и обычным промптом
-          2. без response_format (некоторые модели его не соблюдают), system
-             пере-обогащён инструкцией «верни ТОЛЬКО JSON»
-          3-5. с растущей температурой и явным reminder про JSON в user-сообщении
-
-        На каждой попытке используется _extract_json — извлекает первый
-        валидный {...} блок из ответа даже если модель добавила преамбулу.
-        Если за 5 попыток не получили dict — KieAIError.
+        """LLM с robust JSON extraction. Авто-выбор endpoint:
+          • gpt-5-4 / codex-* → /codex/v1/responses (Responses API)
+          • прочие (gpt-5-2, gemini-*, …) → /{model}/v1/chat/completions
         """
         m = model or self._llm_model
+        if _is_responses_api(m):
+            return await self._chat_json_responses_api(system=system, user=user, model=m)
         url = f"{self._base}/{m}/v1/chat/completions"
 
         last_content = ""
