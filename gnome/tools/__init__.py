@@ -16,7 +16,21 @@ def _load_builtin() -> list[Tool]:
     from .echo import EchoTool
     from .list_skills_tool import ListSkillsTool
     from .read_memory import ReadMemoryTool
-    return [EchoTool(), ListSkillsTool(), ReadMemoryTool()]
+    from .file_read import FileReadTool
+    from .grep_tool import GrepTool
+    from .glob_tool import GlobTool
+    from .read_logs import ReadLogsTool
+    from .list_dir import ListDirTool
+    return [
+        EchoTool(),
+        ListSkillsTool(),
+        ReadMemoryTool(),
+        FileReadTool(),
+        GrepTool(),
+        GlobTool(),
+        ReadLogsTool(),
+        ListDirTool(),
+    ]
 
 
 def _load_skills(skills_dir: Path) -> list[Tool]:

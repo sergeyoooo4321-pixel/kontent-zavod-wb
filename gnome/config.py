@@ -29,6 +29,16 @@ class Settings(BaseSettings):
     BACKEND_URL: str = "http://127.0.0.1:8000"
     INTERNAL_TOKEN: str = ""
 
+    # Корень проекта — для file_read/grep/glob ограничения и read_logs.
+    # По умолчанию — родительская папка от gnome/ (т.е. корень репо).
+    WORKSPACE_ROOT: str = ""
+
+    @property
+    def workspace_root(self) -> Path:
+        if self.WORKSPACE_ROOT:
+            return Path(self.WORKSPACE_ROOT).resolve()
+        return GNOME_DIR.parent.resolve()
+
     @property
     def data_dir(self) -> Path:
         d = GNOME_DIR / "data"
