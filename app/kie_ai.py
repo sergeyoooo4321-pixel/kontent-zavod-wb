@@ -55,6 +55,62 @@ def _strip_json_markdown(content: str) -> str:
     return s
 
 
+def _extract_json(content: str) -> dict | None:
+    """Пытается извлечь JSON-объект из любого текста модели.
+
+    Стратегии (по очереди):
+      1. Чистый json.loads после strip + удаления markdown-обёртки.
+      2. Поиск первого `{...}` блока с балансировкой скобок и {",[].
+         Это покрывает случаи когда модель добавила «Вот ответ:» преамбулу
+         или «Надеюсь, помог!» в конце.
+
+    Возвращает dict если удалось распарсить, иначе None.
+    """
+    if not content:
+        return None
+    cleaned = _strip_json_markdown(content)
+    # Стратегия 1
+    try:
+        obj = json.loads(cleaned)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, ValueError):
+        pass
+    # Стратегия 2: ищем первый {...} с балансировкой
+    start = cleaned.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(cleaned)):
+        ch = cleaned[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                blob = cleaned[start:i + 1]
+                try:
+                    obj = json.loads(blob)
+                    if isinstance(obj, dict):
+                        return obj
+                except (json.JSONDecodeError, ValueError):
+                    return None
+    return None
+
+
 class KieAIClient:
     def __init__(
         self,
@@ -64,7 +120,6 @@ class KieAIClient:
         http: httpx.AsyncClient,
         image_model: str = "gpt-image-2-image-to-image",
         llm_model: str = "gpt-5-2",
-        llm_fallback_model: str = "gpt-4o-mini",
         poll_interval: float = 5.0,
         poll_max_attempts: int = 60,
         max_concurrent: int = 6,
@@ -80,7 +135,6 @@ class KieAIClient:
         }
         self._image_model = image_model
         self._llm_model = llm_model
-        self._llm_fallback_model = llm_fallback_model
         self._poll_interval = poll_interval
         self._poll_max_attempts = poll_max_attempts
         # Глобальный семафор concurrent createTask
@@ -351,56 +405,63 @@ class KieAIClient:
         temperature: float = 0.4,
         max_tokens: int | None = None,
     ) -> dict:
-        """OpenAI-совместимый chat с image_url в content (vision).
+        """OpenAI-совместимый vision chat (text + image_url).
 
         Используется для анализа фото товара и генерации JSON-дизайн-брифа.
+        Применяет robust JSON extraction (_extract_json) и до 5 попыток.
         """
         m = model or self._llm_model
         url = f"{self._base}/{m}/v1/chat/completions"
 
-        body: dict[str, Any] = {
-            "model": m,
-            "response_format": {"type": "json_object"},
-            "temperature": temperature,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ]},
-            ],
-        }
-        if max_tokens:
-            body["max_tokens"] = max_tokens
+        last_content = ""
+        for attempt in range(5):
+            use_response_format = attempt == 0
+            temp = temperature + 0.1 * attempt
+            user_extra = ""
+            if attempt >= 1:
+                user_extra = (
+                    "\n\nЖЁСТКОЕ ТРЕБОВАНИЕ: ответь ТОЛЬКО валидным JSON-объектом, "
+                    "без преамбул и markdown."
+                )
+            sys_extra = "" if use_response_format else "\n\nВажно: ответ ТОЛЬКО валидный JSON-объект, без markdown."
 
-        async with self._sem:
-            r = await self._request_with_429("POST", url, json=body, timeout=180.0)
+            body: dict[str, Any] = {
+                "model": m,
+                "temperature": min(temp, 1.0),
+                "messages": [
+                    {"role": "system", "content": system + sys_extra},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": user + user_extra},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ]},
+                ],
+            }
+            if use_response_format:
+                body["response_format"] = {"type": "json_object"}
+            if max_tokens:
+                body["max_tokens"] = max_tokens
 
-        if r.status_code == 400 and "response_format" in r.text:
-            body.pop("response_format", None)
-            body["messages"][0]["content"] = system + "\n\nВажно: ответ ТОЛЬКО валидный JSON."
-            async with self._sem:
-                r = await self._request_with_429("POST", url, json=body, timeout=180.0)
-        r.raise_for_status()
-        data = r.json()
-        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-        try:
-            return json.loads(_strip_json_markdown(content))
-        except json.JSONDecodeError as e:
-            # один retry с явной подсказкой
-            body["messages"][1]["content"][0]["text"] = user + (
-                "\n\nВажно: предыдущий ответ был невалидным JSON. "
-                "Верни ТОЛЬКО JSON-объект без markdown-обёртки ```json ```."
-            )
-            async with self._sem:
-                r = await self._request_with_429("POST", url, json=body, timeout=180.0)
-            r.raise_for_status()
-            data = r.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
             try:
-                return json.loads(_strip_json_markdown(content))
-            except json.JSONDecodeError:
-                raise KieAIError(f"vision LLM returned non-JSON twice: {content[:300]}") from e
+                async with self._sem:
+                    r = await self._request_with_429("POST", url, json=body, timeout=180.0)
+                if r.status_code == 400 and "response_format" in r.text:
+                    body.pop("response_format", None)
+                    async with self._sem:
+                        r = await self._request_with_429("POST", url, json=body, timeout=180.0)
+                r.raise_for_status()
+                data = r.json()
+                last_content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            except httpx.HTTPError as e:
+                logger.warning("vision attempt %d/5 HTTP error: %s", attempt + 1, str(e)[:200])
+                continue
+
+            obj = _extract_json(last_content)
+            if obj is not None:
+                return obj
+            logger.warning("vision attempt %d/5: не удалось распарсить JSON, content=%r",
+                           attempt + 1, last_content[:150])
+
+        raise KieAIError(f"vision LLM returned non-JSON после 5 попыток: {last_content[:300]}")
 
     @retry(
         retry=retry_if_exception_type(httpx.HTTPError),
@@ -417,73 +478,72 @@ class KieAIClient:
         temperature: float = 0.2,
         max_tokens: int | None = None,
     ) -> dict:
-        """OpenAI-совместимый chat/completions с response_format=json_object.
+        """OpenAI-совместимый chat/completions с robust JSON extraction.
 
-        Стратегия:
-          1. Пробуем основную модель (model или self._llm_model).
-          2. При невалидном JSON — повторяем с подсказкой.
-          3. Если опять — пробуем fallback-модель (self._llm_fallback_model).
-          4. Если и она не отвечает — KieAIError.
-        Это лечит kie.ai outage конкретной модели — gpt-5-2 иногда возвращает
-        пустой content, тогда gpt-4o-mini обычно работает.
+        Стратегия — 5 попыток:
+          1. с response_format=json_object и обычным промптом
+          2. без response_format (некоторые модели его не соблюдают), system
+             пере-обогащён инструкцией «верни ТОЛЬКО JSON»
+          3-5. с растущей температурой и явным reminder про JSON в user-сообщении
+
+        На каждой попытке используется _extract_json — извлекает первый
+        валидный {...} блок из ответа даже если модель добавила преамбулу.
+        Если за 5 попыток не получили dict — KieAIError.
         """
-        primary = model or self._llm_model
-        # Fallback может быть списком через запятую: «gpt-4o-mini,claude-haiku,deepseek-chat»
-        fallbacks_raw = self._llm_fallback_model or ""
-        fallbacks = [m.strip() for m in fallbacks_raw.split(",") if m.strip() and m.strip() != primary]
+        m = model or self._llm_model
+        url = f"{self._base}/{m}/v1/chat/completions"
 
-        async def _call_with_model(m: str, extra_user: str = "") -> str:
-            url = f"{self._base}/{m}/v1/chat/completions"
+        last_content = ""
+        for attempt in range(5):
+            # Прогрессирующая стратегия от попытки к попытке
+            use_response_format = attempt == 0  # на 1-й пробуем с native JSON-mode
+            temp = temperature + 0.1 * attempt
+            user_extra = ""
+            if attempt >= 1:
+                user_extra = (
+                    "\n\nЖЁСТКОЕ ТРЕБОВАНИЕ: ответь ТОЛЬКО валидным JSON-объектом. "
+                    "Никаких преамбул, пояснений или markdown-обёрток. "
+                    "Сразу с открывающей фигурной скобки `{` до закрывающей `}`."
+                )
+            sys_extra = ""
+            if not use_response_format:
+                sys_extra = "\n\nВажно: ответ ТОЛЬКО валидный JSON-объект, без markdown."
+
             body: dict[str, Any] = {
                 "model": m,
-                "response_format": {"type": "json_object"},
-                "temperature": temperature,
+                "temperature": min(temp, 1.0),
                 "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user + extra_user},
+                    {"role": "system", "content": system + sys_extra},
+                    {"role": "user", "content": user + user_extra},
                 ],
             }
+            if use_response_format:
+                body["response_format"] = {"type": "json_object"}
             if max_tokens:
                 body["max_tokens"] = max_tokens
-            r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
-            if r.status_code == 400 and "response_format" in r.text:
-                body.pop("response_format", None)
-                body["messages"][0]["content"] = system + "\n\nВажно: ответ ТОЛЬКО валидный JSON, без markdown."
-                r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
-            r.raise_for_status()
-            data = r.json()
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
-            return content
 
-        # Попытка 1: основная модель
-        content = await _call_with_model(primary)
-        try:
-            return json.loads(_strip_json_markdown(content))
-        except json.JSONDecodeError:
-            pass
-
-        # Попытка 2: основная модель с подсказкой
-        content = await _call_with_model(
-            primary,
-            "\n\nВажно: предыдущий ответ был невалидным JSON. Верни ТОЛЬКО JSON-объект без markdown-обёртки.",
-        )
-        try:
-            return json.loads(_strip_json_markdown(content))
-        except json.JSONDecodeError:
-            pass
-
-        # Попытка 3+: фоллбэки по очереди
-        last_content = content
-        for fb in fallbacks:
-            logger.warning("chat_json: пробуем fallback модель %s", fb)
             try:
-                last_content = await _call_with_model(fb)
-                return json.loads(_strip_json_markdown(last_content))
-            except (json.JSONDecodeError, httpx.HTTPError) as e:
-                logger.warning("chat_json fallback %s фейл: %s", fb, str(e)[:200])
+                r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
+                # Если 400 на response_format — повторяем без него на этой же попытке
+                if r.status_code == 400 and "response_format" in r.text:
+                    body.pop("response_format", None)
+                    body["messages"][0]["content"] = system + sys_extra + \
+                        "\n\nВажно: ответ ТОЛЬКО валидный JSON, без markdown."
+                    r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
+                r.raise_for_status()
+                data = r.json()
+                last_content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            except httpx.HTTPError as e:
+                logger.warning("chat_json attempt %d/5 HTTP error: %s", attempt + 1, str(e)[:200])
+                last_content = ""
                 continue
 
-        raise KieAIError(
-            f"LLM returned non-JSON по всем моделям (primary={primary}, "
-            f"fallbacks={fallbacks}): last={last_content[:300]}"
-        )
+            obj = _extract_json(last_content)
+            if obj is not None:
+                return obj
+            logger.warning(
+                "chat_json attempt %d/5: не удалось распарсить JSON, content=%r",
+                attempt + 1, last_content[:150],
+            )
+
+        raise KieAIError(f"LLM returned non-JSON после 5 попыток (model={m}): {last_content[:300]}")

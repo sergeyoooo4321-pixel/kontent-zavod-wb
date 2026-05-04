@@ -53,6 +53,7 @@ from .prompts import (
     build_main_prompt,
     build_pack_prompt,
     build_titles_prompts,
+    build_titles_prompts_batch,
     compile_image_prompt,
 )
 from .reports import build_final_report_md
@@ -205,18 +206,32 @@ async def process_product_images(
             compile_image_prompt(brief, state.name, mode="extra")
             if brief else build_extra_prompt(state.name)
         )
-        # return_exceptions=True — один failed таск не валит остальные
+        # Сначала main, потом параллельно pack2/pack3/extra. Это уменьшает burst
+        # на kie.ai (4 параллельных createTask за 0.5 сек → реже Internal Error)
+        # и main как «приоритетный» получает первый таймслот, не дожидаясь очереди.
+        failed_modes: list[str] = []
+
+        main_res = await _gen("main", main_prompt)
+        if isinstance(main_res, BaseException):
+            logger.error("main gen exception: %s", main_res)
+            failed_modes.append("main")
+        else:
+            tag, url, err = main_res
+            if url:
+                state.images[tag] = url
+            else:
+                state.errors.append(f"{tag}: {err}")
+                failed_modes.append(tag)
+
         results = await asyncio.gather(
-            _gen("main", main_prompt),
             _gen("pack2", pack2_prompt),
             _gen("pack3", pack3_prompt),
             _gen("extra", extra_prompt),
             return_exceptions=True,
         )
-        failed_modes: list[str] = []
         for res in results:
             if isinstance(res, BaseException):
-                logger.error("legacy gather got exception: %s", res)
+                logger.error("aux gather exception: %s", res)
                 continue
             tag, url, err = res
             if url:
@@ -560,101 +575,104 @@ async def build_skus_and_texts(
     # Парсим исходное название один раз — используется для детерминированных форматтеров
     parsed = parse_input_line(state.name, brand_hint=state.brand)
     if parsed["brand"] and not state.brand:
-        # Если бренд был извлечён из строки и в ProductState не задан — заполним для дальнейшего использования
         state.brand = parsed["brand"]
 
-    # 2. LLM тексты + атрибуты + характеристики по каждой qty
+    qtys = [r["qty"] for r in state.skus_3]
+
+    # 2.1 ОДИН LLM-вызов на ВСЕ qty (titles + annotation + composition)
+    titles_by_qty: dict[int, dict] = {}
+    try:
+        sys_t, usr_t = build_titles_prompts_batch(
+            state.name, state.brand,
+            state.ozon_category.path, state.wb_subject.path,
+            qtys,
+        )
+        txt_batch = await deps.kie.chat_json(system=sys_t, user=usr_t)
+        # LLM возвращает {"1": {...}, "2": {...}, "3": {...}}
+        for q in qtys:
+            entry = txt_batch.get(str(q)) or txt_batch.get(q) or {}
+            if isinstance(entry, dict):
+                titles_by_qty[q] = entry
+    except Exception as e:
+        state.errors.append(f"titles batch: {e} (используем normalize.py fallback)")
+        logger.warning("titles batch fail: %s", e)
+
+    # 2.2 Раскладываем titles по SKU + post-process детерминированными форматтерами
     for sku_row in state.skus_3:
         sku = sku_row["sku"]
         qty = sku_row["qty"]
+        det_t_o = format_ozon_title(parsed, qty=qty)
+        det_t_w_short = format_wb_short_title(parsed)
+        det_t_w_full = format_wb_full_title(parsed, qty=qty)
+        e = titles_by_qty.get(qty, {})
+        state.titles[sku] = {
+            "title_ozon": det_t_o or limit_chars(e.get("title_ozon", ""), 500),
+            "title_wb_short": det_t_w_short or limit_chars(
+                strip_brand(e.get("title_wb_short", ""), state.brand), 60
+            ),
+            "title_wb_full": det_t_w_full or limit_chars(e.get("title_wb_full", ""), 200),
+            "annotation_ozon": e.get("annotation_ozon", ""),
+            "composition_wb": limit_chars(e.get("composition_wb", ""), 100),
+        }
 
-        # Детерминированные титулы из normalize.py (главное имя — без LLM-сюрпризов).
-        # LLM в build_titles_prompts всё ещё используется ДЛЯ описания и состава (annotation_ozon,
-        # composition_wb), но title_* мы пост-обрабатываем правилами регламента.
-        deterministic_title_ozon = format_ozon_title(parsed, qty=qty)
-        deterministic_title_wb_short = format_wb_short_title(parsed)
-        deterministic_title_wb_full = format_wb_full_title(parsed, qty=qty)
+    if not cat:
+        return
 
+    # 2.3 ОДИН LLM-вызов Ozon атрибутов на товар (атрибуты не зависят от qty —
+    # это свойства самого продукта: бренд, состав, страна и т.п.). Применяем
+    # к каждому из 3 SKU.
+    ozon_llm: dict | None = None
+    if cat.ozon_attrs:
         try:
-            system, user = build_titles_prompts(
-                state.name,
-                state.brand,
-                state.ozon_category.path,
-                state.wb_subject.path,
-                qty,
+            sys_o, usr_o = build_attributes_prompts(
+                state.name, state.brand, state.ozon_category.path,
+                1, cat.ozon_attrs, cat.ozon_attr_values,
             )
-            txt = await deps.kie.chat_json(system=system, user=user)
-            # Title-поля — детерминированные форматтеры (LLM-варианты как fallback если форматтер пустой)
-            title_ozon = deterministic_title_ozon or limit_chars(txt.get("title_ozon", ""), 500)
-            title_wb_short = deterministic_title_wb_short or limit_chars(
-                strip_brand(txt.get("title_wb_short", ""), state.brand), 60
-            )
-            title_wb_full = deterministic_title_wb_full or limit_chars(txt.get("title_wb_full", ""), 200)
-            state.titles[sku] = {
-                "title_ozon": title_ozon,
-                "title_wb_short": title_wb_short,
-                "title_wb_full": title_wb_full,
-                "annotation_ozon": txt.get("annotation_ozon", ""),
-                "composition_wb": limit_chars(txt.get("composition_wb", ""), 100),
-            }
+            ozon_llm = await deps.kie.chat_json(system=sys_o, user=usr_o)
         except Exception as e:
-            # При фейле LLM — всё равно собираем titles из детерминированных форматтеров
-            state.titles[sku] = {
-                "title_ozon": deterministic_title_ozon,
-                "title_wb_short": deterministic_title_wb_short,
-                "title_wb_full": deterministic_title_wb_full,
-                "annotation_ozon": "",
-                "composition_wb": "",
-            }
-            state.errors.append(f"titles {sku}: {e} (titles взяты из normalize)")
-            logger.exception("titles %s err: %s", sku, e)
-
-        if not cat:
-            continue
-
-        # Ozon атрибуты
-        if cat.ozon_attrs:
-            try:
-                sys_o, usr_o = build_attributes_prompts(
-                    state.name, state.brand, state.ozon_category.path,
-                    sku_row["qty"], cat.ozon_attrs, cat.ozon_attr_values,
-                )
-                llm_o = await deps.kie.chat_json(system=sys_o, user=usr_o)
-                attrs, warns = map_ozon_attributes(
-                    llm_o, cat.ozon_attrs, cat.ozon_attr_values,
-                    brand_hint=state.brand,
-                )
-                state.attributes_ozon[sku] = attrs  # None если required не нашёлся
-                if attrs is None:
-                    state.errors.append(f"ozon attrs {sku}: " + "; ".join(warns))
-                else:
-                    state.warnings.extend(f"{sku}: {w}" for w in warns)
-            except Exception as e:
-                state.errors.append(f"ozon attrs {sku}: {e}")
+            state.errors.append(f"ozon attrs (batch): {e}")
+            logger.warning("ozon attrs batch fail: %s", e)
+        for sku_row in state.skus_3:
+            sku = sku_row["sku"]
+            if ozon_llm is None:
                 state.attributes_ozon[sku] = None
-                logger.exception("ozon attrs %s err: %s", sku, e)
+                continue
+            attrs, warns = map_ozon_attributes(
+                ozon_llm, cat.ozon_attrs, cat.ozon_attr_values,
+                brand_hint=state.brand,
+            )
+            state.attributes_ozon[sku] = attrs
+            if attrs is None:
+                state.errors.append(f"ozon attrs {sku}: " + "; ".join(warns))
+            else:
+                state.warnings.extend(f"{sku}: {w}" for w in warns)
 
-        # WB характеристики
-        if cat.wb_charcs:
-            try:
-                sys_w, usr_w = build_characteristics_prompts(
-                    state.name, state.brand, state.wb_subject.path,
-                    sku_row["qty"], cat.wb_charcs, cat.wb_charc_values,
-                )
-                llm_w = await deps.kie.chat_json(system=sys_w, user=usr_w)
-                charcs, warns = map_wb_characteristics(
-                    llm_w, cat.wb_charcs, cat.wb_charc_values,
-                    brand_hint=state.brand,
-                )
-                state.characteristics_wb[sku] = charcs
-                if charcs is None:
-                    state.errors.append(f"wb charcs {sku}: " + "; ".join(warns))
-                else:
-                    state.warnings.extend(f"{sku}: {w}" for w in warns)
-            except Exception as e:
-                state.errors.append(f"wb charcs {sku}: {e}")
+    # 2.4 ОДИН LLM-вызов WB характеристик на товар.
+    wb_llm: dict | None = None
+    if cat.wb_charcs:
+        try:
+            sys_w, usr_w = build_characteristics_prompts(
+                state.name, state.brand, state.wb_subject.path,
+                1, cat.wb_charcs, cat.wb_charc_values,
+            )
+            wb_llm = await deps.kie.chat_json(system=sys_w, user=usr_w)
+        except Exception as e:
+            state.errors.append(f"wb charcs (batch): {e}")
+            logger.warning("wb charcs batch fail: %s", e)
+        for sku_row in state.skus_3:
+            sku = sku_row["sku"]
+            if wb_llm is None:
                 state.characteristics_wb[sku] = None
-                logger.exception("wb charcs %s err: %s", sku, e)
+                continue
+            charcs, warns = map_wb_characteristics(
+                wb_llm, cat.wb_charcs, cat.wb_charc_values,
+                brand_hint=state.brand,
+            )
+            state.characteristics_wb[sku] = charcs
+            if charcs is None:
+                state.errors.append(f"wb charcs {sku}: " + "; ".join(warns))
+            else:
+                state.warnings.extend(f"{sku}: {w}" for w in warns)
 
 
 # ─── Этап 5: заливка Ozon ───────────────────────────────────────

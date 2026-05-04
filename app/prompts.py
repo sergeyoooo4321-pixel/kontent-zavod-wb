@@ -653,6 +653,47 @@ def build_titles_prompts(
     return system, user
 
 
+def build_titles_prompts_batch(
+    product_name: str,
+    brand: str | None,
+    ozon_category_path: str,
+    wb_subject_path: str,
+    qtys: list[int],
+) -> tuple[str, str]:
+    """То же что build_titles_prompts, но за ОДИН LLM-вызов на ВСЕ qty.
+
+    Возвращает (system, user) для запроса. LLM вернёт JSON
+    {"<qty>": {title_ozon, title_wb_short, title_wb_full, annotation_ozon, composition_wb}}.
+    """
+    system = (
+        "Ты — копирайтер для маркетплейсов. Тебе дают ОДИН товар и список "
+        "вариантов qty (1, 2, 3 — одиночка, набор 2, набор 3). Ты возвращаешь "
+        "тексты для КАЖДОГО варианта одним JSON.\n\n"
+        "ИМЕНОВАНИЕ\n"
+        "• Ozon title_ozon: «[Набор N шт ]Бренд product_part». БЕЗ дефиса между брендом и товаром.\n"
+        "• WB title_wb_short: БЕЗ бренда, ≤60 символов, без обрыва на середине слова.\n"
+        "• WB title_wb_full: С брендом, для qty>1 префикс «Набор N шт».\n\n"
+        "АННОТАЦИЯ И СОСТАВ\n"
+        "• annotation_ozon: ≥6 ПОЛНОЦЕННЫХ предложений, УНИКАЛЬНАЯ под каждый qty. "
+        "Для qty=2/3 явно упомяни «комплект из N единиц», объясни преимущество запаса.\n"
+        "• composition_wb: ≤100 символов. Сокращай ключевыми компонентами.\n\n"
+        "ФОРМАТ ОТВЕТА\n"
+        "Строго JSON: {\"1\": {...}, \"2\": {...}, \"3\": {...}}\n"
+        "Каждое значение — объект с полями title_ozon, title_wb_short, title_wb_full, "
+        "annotation_ozon, composition_wb. Только JSON, без markdown."
+    )
+    qtys_str = ", ".join(str(q) for q in qtys)
+    user = (
+        f"Товар (исходная строка): {product_name}\n"
+        f"Бренд: {brand or '—'}\n"
+        f"Категория Ozon: {ozon_category_path}\n"
+        f"Категория WB: {wb_subject_path}\n"
+        f"qty варианты: {qtys_str}\n\n"
+        f"Верни JSON {{\"1\": {{...}}, ...}} для каждого qty из списка."
+    )
+    return system, user
+
+
 # ─── атрибуты Ozon / характеристики WB ───────────────────────────
 
 
