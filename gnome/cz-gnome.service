@@ -1,0 +1,18 @@
+[Unit]
+Description=Гномик контент-завода (AI-агент 24/7)
+After=network.target
+
+[Service]
+Type=simple
+User=albert
+Group=albert
+WorkingDirectory=/home/albert/cz-backend
+EnvironmentFile=/home/albert/cz-backend/gnome/.env
+ExecStart=/home/albert/cz-backend/.venv-gnome/bin/uvicorn gnome.main:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

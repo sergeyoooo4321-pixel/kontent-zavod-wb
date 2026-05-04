@@ -1,0 +1,2 @@
+- [identity.md](identity.md) — кто я
+- [about_marketplaces.md](about_marketplaces.md) — контекст WB/Ozon, домен, кабинеты
