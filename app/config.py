@@ -77,6 +77,13 @@ class Settings(BaseSettings):
     KIE_LLM_MODEL: str = "gpt-5-2"
     KIE_POLL_INTERVAL_SEC: float = 5.0
     KIE_POLL_MAX_ATTEMPTS: int = 60
+    # Лимит kie.ai: 20 createTask / 10 сек = 2 req/sec. Token-bucket throttle
+    # в KieAIClient гарантирует не превышать; занижение = больше задержка между
+    # createTask, но 0% шанс получить 429.
+    KIE_RATE_PER_SEC: float = 2.0
+    # Concurrent createTask. kie.ai допускает 100+, но 6 — безопасный default
+    # чтобы не штормить при переборке партии.
+    KIE_MAX_CONCURRENT: int = 6
 
     # Yandex Object Storage
     S3_ENDPOINT: str = "https://storage.yandexcloud.net"

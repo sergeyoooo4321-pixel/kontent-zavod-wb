@@ -1,9 +1,24 @@
-"""kie.ai клиент: image generation (createTask + polling) + LLM (chat completions)."""
+"""kie.ai клиент: image generation (createTask + polling) + LLM (chat completions).
+
+Ratelimit kie.ai (https://docs.kie.ai/):
+  • 20 createTask за 10 секунд = 2 req/sec в среднем
+  • 100+ concurrent running tasks
+  • 429 → отклоняется БЕЗ постановки в очередь (не ретраит kie сама)
+  • Internal Error без Retry-After — нужен наш экспоненциальный бэкофф
+
+Реализовано:
+  • Token-bucket throttle на 2 createTask/sec (KIE_RATE_PER_SEC в config)
+  • Semaphore = 6 одновременных createTask
+  • generate_image_with_retry: 5 попыток с паузами 5/10/20/40/60 сек + jitter
+  • При 429 ждём Retry-After (если есть) или 30 сек, до 5 раз
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import random
+import time
 from typing import Any
 
 import httpx
@@ -51,7 +66,8 @@ class KieAIClient:
         llm_model: str = "gpt-5-2",
         poll_interval: float = 5.0,
         poll_max_attempts: int = 60,
-        max_concurrent: int = 8,
+        max_concurrent: int = 6,
+        rate_per_sec: float = 2.0,
     ):
         self._base = base_url.rstrip("/")
         self._http = http
@@ -65,22 +81,39 @@ class KieAIClient:
         self._llm_model = llm_model
         self._poll_interval = poll_interval
         self._poll_max_attempts = poll_max_attempts
-        # V4 — глобальный семафор для всех запросов к kie.ai
+        # Глобальный семафор concurrent createTask
         self._sem = asyncio.Semaphore(max_concurrent)
+        # Token-bucket throttle для createTask: kie.ai допускает 20 / 10 сек
+        self._rate_per_sec = max(0.1, rate_per_sec)
+        self._min_gap_sec = 1.0 / self._rate_per_sec
+        self._last_create_at = 0.0
+        self._rate_lock = asyncio.Lock()
+
+    async def _throttle_create(self) -> None:
+        """Token-bucket throttle: гарантирует не более rate_per_sec createTask запросов."""
+        async with self._rate_lock:
+            now = time.monotonic()
+            wait = self._last_create_at + self._min_gap_sec - now
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_create_at = time.monotonic()
 
     async def _request_with_429(self, method: str, url: str, **kwargs) -> httpx.Response:
-        """HTTP с обработкой 429 Too Many Requests (Retry-After)."""
-        for attempt in range(3):
+        """HTTP с обработкой 429 Too Many Requests (Retry-After + бэкофф)."""
+        for attempt in range(5):
             r = await self._http.request(method, url, headers=self._headers, **kwargs)
             if r.status_code != 429:
                 return r
+            # При 429 запрос отклонён БЕЗ очереди (kie.ai docs) — нужен наш ретрай.
             ra = 5.0
             try:
                 ra = float(r.headers.get("Retry-After") or 5)
             except ValueError:
                 pass
-            logger.warning("kie 429, retry-after=%s attempt=%d", ra, attempt)
-            await asyncio.sleep(min(ra, 30))
+            wait = min(max(ra, 5.0 * (2 ** attempt)), 60.0)
+            wait += random.uniform(0, wait * 0.2)  # jitter ±20%
+            logger.warning("kie 429, retry-after=%s wait=%.1fs attempt=%d/5", ra, wait, attempt + 1)
+            await asyncio.sleep(wait)
         return r
 
     # ─── Image ──────────────────────────────────────────────────
@@ -131,6 +164,8 @@ class KieAIClient:
             body["input"]["guidance_scale"] = guidance_scale
         if seed is not None:
             body["input"]["seed"] = seed
+        # Token-bucket throttle перед заходом в семафор — соблюдаем 2 req/sec
+        await self._throttle_create()
         async with self._sem:
             r = await self._request_with_429(
                 "POST",
@@ -238,13 +273,14 @@ class KieAIClient:
         image_weight: float | None = None,
         guidance_scale: float | None = None,
         seed: int | None = None,
-        max_retries: int = 2,
+        max_retries: int = 4,
     ) -> str:
-        """Create + poll с retry на ОБОИХ этапах.
+        """Create + poll с retry на ОБОИХ этапах + длинные паузы для kie-outage.
 
-        Retry полного цикла нужен для safety-rejects (OpenAI блочит товар, но
-        повторная попытка с новым внутренним рандомом часто проходит) и для
-        прочих task-failure (timeout, ratelimit-by-task, etc).
+        Лимит kie.ai: 20 req / 10 сек = 2 req/sec. При Internal Error (на стороне
+        kie) делаем 5 полных попыток с паузами 5/10/20/40 сек + jitter — даём
+        kie восстановиться. Получается до ~75 сек ожидания на одну фотку, но
+        партия из 4 фото всё равно не превышает 5 минут.
         """
         last_err: Exception | None = None
         for attempt in range(max_retries + 1):
@@ -258,7 +294,7 @@ class KieAIClient:
                     image_weight=image_weight,
                     guidance_scale=guidance_scale,
                     seed=seed,
-                    max_retries=max_retries,
+                    max_retries=2,  # внутренний retry для самого create достаточно мал
                 )
                 return await self.poll_image_task(task_id)
             except (KieAIError, KieAITimeout) as e:
@@ -268,7 +304,10 @@ class KieAIClient:
                     attempt + 1, max_retries + 1, str(e)[:200],
                 )
                 if attempt < max_retries:
-                    await asyncio.sleep(2 ** attempt)
+                    # 5, 10, 20, 40 сек + jitter ±20%
+                    base = 5 * (2 ** attempt)
+                    wait = base + random.uniform(0, base * 0.2)
+                    await asyncio.sleep(min(wait, 60))
         raise KieAIError(
             f"generate_image failed after {max_retries + 1} attempts: {last_err}"
         )

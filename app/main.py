@@ -49,6 +49,8 @@ async def lifespan(app: FastAPI):
         llm_model=settings.KIE_LLM_MODEL,
         poll_interval=settings.KIE_POLL_INTERVAL_SEC,
         poll_max_attempts=settings.KIE_POLL_MAX_ATTEMPTS,
+        max_concurrent=settings.KIE_MAX_CONCURRENT,
+        rate_per_sec=settings.KIE_RATE_PER_SEC,
     )
     s3 = S3Client(
         endpoint=settings.S3_ENDPOINT,
