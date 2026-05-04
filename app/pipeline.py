@@ -1066,7 +1066,15 @@ async def upload_wb(
 
 async def run_batch(req: RunRequest, deps: Deps) -> None:
     """Главная точка пайплайна. Кладётся в FastAPI BackgroundTasks."""
+    import time as _time
+    timings: dict[str, float] = {}
     try:
+        # Typing-индикатор: бот «печатает» пока идут долгие этапы
+        try:
+            await deps.tg.send_chat_action(req.chat_id, "typing")
+        except Exception:
+            pass
+
         await deps.tg.send(
             req.chat_id,
             f"🟦 *Запускаю партию* `{req.batch_id}` ({len(req.products)} товаров)",
@@ -1076,11 +1084,16 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
         sem = asyncio.Semaphore(settings.MAX_PARALLEL_PRODUCTS)
 
         # Этап 1: фото
+        t0 = _time.monotonic()
         await asyncio.gather(*[
             process_product_images(s, req.batch_id, req.chat_id, deps, sem) for s in states
         ])
+        timings["1_photos"] = _time.monotonic() - t0
         ok_imgs = sum(1 for s in states if len(s.images) == 4)
-        await deps.tg.send(req.chat_id, f"📸 Фото: {ok_imgs}/{len(states)} товаров полностью готовы")
+        await deps.tg.send(
+            req.chat_id,
+            f"📸 Фото: {ok_imgs}/{len(states)} товаров готовы (за {timings['1_photos']:.0f} сек)"
+        )
 
         # Какие стороны нужны исходя из target-кабинетов (а не всех настроенных)
         targets_preview: list[Cabinet] = []
@@ -1101,7 +1114,13 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
             await deps.tg.send(req.chat_id, "⚠️ Ozon/WB ключи не заданы — пропускаю этапы 2-4. Фото залиты в S3.")
             return
 
+        try:
+            await deps.tg.send_chat_action(req.chat_id, "typing")
+        except Exception:
+            pass
+
         # Этап 2: категории — каждая сторона грузится независимо
+        t0 = _time.monotonic()
         ozon_leaves: list[dict] = []
         wb_leaves: list[dict] = []
         if need_ozon:
@@ -1122,9 +1141,18 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
             await deps.tg.send(req.chat_id, "⚠️ Не удалось получить категории ни с Ozon, ни с WB. Этап заливки будет с ошибками.")
         else:
             await asyncio.gather(*[match_category(s, ozon_leaves, wb_leaves, deps) for s in states])
-            await deps.tg.send(req.chat_id, "📂 Категории определены")
+            timings["2_category"] = _time.monotonic() - t0
+            await deps.tg.send(
+                req.chat_id,
+                f"📂 Категории определены (за {timings['2_category']:.0f} сек)"
+            )
 
         # Этап 3: справочники + шаблоны (per-category)
+        try:
+            await deps.tg.send_chat_action(req.chat_id, "typing")
+        except Exception:
+            pass
+        t0 = _time.monotonic()
         unique_cats = dedup_categories(states)
         cat_data: dict[tuple, CategoryData] = {}
         for ck in unique_cats:
@@ -1132,10 +1160,25 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
                 cat_data[ck] = await load_category_data(ck[0], ck[1], ck[2], deps)
             except Exception as e:
                 logger.exception("load_category_data %s: %s", ck, e)
-        await deps.tg.send(req.chat_id, f"📋 Загружено {len(cat_data)} категорий со справочниками")
+        timings["3_dictionaries"] = _time.monotonic() - t0
+        await deps.tg.send(
+            req.chat_id,
+            f"📋 Загружено {len(cat_data)} категорий со справочниками "
+            f"(за {timings['3_dictionaries']:.0f} сек)"
+        )
 
         # Этап 4: тексты + расширение SKU
+        try:
+            await deps.tg.send_chat_action(req.chat_id, "typing")
+        except Exception:
+            pass
+        t0 = _time.monotonic()
         await asyncio.gather(*[build_skus_and_texts(s, cat_data, deps) for s in states])
+        timings["4_texts"] = _time.monotonic() - t0
+        await deps.tg.send(
+            req.chat_id,
+            f"✏️ Тексты и атрибуты собраны (за {timings['4_texts']:.0f} сек)"
+        )
 
         # Какие кабинеты используем для заливки
         target_cabinets: list[Cabinet] = []
@@ -1178,6 +1221,11 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
 
         # Этап 5: для каждого кабинета параллельно ozon + wb
         # gather с return_exceptions, чтобы один проблемный кабинет не валил остальные
+        try:
+            await deps.tg.send_chat_action(req.chat_id, "typing")
+        except Exception:
+            pass
+        t0 = _time.monotonic()
         all_reports: list[Report] = []
         for cab in target_cabinets:
             cab_results = await asyncio.gather(
@@ -1193,6 +1241,7 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
                         batch_id=req.batch_id, total=0,
                         errors=[ReportItem(sku="*", mp=cab.label, reason=str(res)[:200])],
                     ))
+        timings["5_upload"] = _time.monotonic() - t0
 
         # Финальный отчёт = сумма по всем кабинетам
         final = Report(batch_id=req.batch_id, total=0)
@@ -1224,6 +1273,22 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
             logger.warning("case_log write failed: %s", e)
 
         await deps.tg.send(req.chat_id, build_final_report_md(final), parse_mode="Markdown")
+        # Тайминг этапов — отдельной строкой, чтобы юзер видел структуру времени
+        if timings:
+            total = sum(timings.values())
+            timing_lines = [f"⏱ *Тайминг этапов* (всего {total:.0f}с):"]
+            stage_names = {
+                "1_photos": "📸 Фото",
+                "2_category": "📂 Категории",
+                "3_dictionaries": "📋 Справочники",
+                "4_texts": "✏️ Тексты+атрибуты",
+                "5_upload": "🚚 Заливка",
+            }
+            for k in ("1_photos", "2_category", "3_dictionaries", "4_texts", "5_upload"):
+                if k in timings:
+                    name = stage_names.get(k, k)
+                    timing_lines.append(f"• {name}: {timings[k]:.1f}с")
+            await deps.tg.send(req.chat_id, "\n".join(timing_lines), parse_mode="Markdown")
     except Exception as e:
         logger.exception("run_batch fatal: %s", e)
         try:

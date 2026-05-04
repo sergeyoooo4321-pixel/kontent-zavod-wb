@@ -172,6 +172,22 @@ class TelegramClient:
         text = "\n".join(f"• {u}" for u, _ in photos)
         await self.send(chat_id, text, parse_mode=None)
 
+    async def send_chat_action(self, chat_id: int, action: str = "typing") -> None:
+        """Показывает «печатает…» в чате на ~5 сек.
+
+        Полезно во время длинных операций (LLM-вызовы, kie generate) — юзер
+        видит что бот работает, а не завис. action: typing / upload_photo /
+        upload_document.
+        """
+        try:
+            await self._http.post(
+                f"{self._url}/sendChatAction",
+                json={"chat_id": chat_id, "action": action},
+                timeout=5,
+            )
+        except Exception:
+            pass  # не критично если упал
+
     async def send_with_buttons(
         self,
         chat_id: int,

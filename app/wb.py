@@ -91,26 +91,48 @@ class WBClient:
     # ─── категории/предметы ─────────────────────────────────
 
     async def subjects_tree(self, locale: str = "ru") -> list[dict]:
-        """GET /content/v2/object/all — все subjects (предметы) с in-memory кешем.
+        """GET /content/v2/object/all — все subjects c кешем in-memory + disk.
 
-        Кеш: 1 час. Subjects редко меняются, а тяжёлый запрос (8 страниц по 1000)
-        провоцирует WB global limiter «too many requests per seller».
+        Кеш TTL: 6 часов. Subjects редко меняются (~раз в неделю), а тяжёлый
+        запрос (~7-10 страниц по 1000) провоцирует WB «too many requests
+        per seller». Disk-кеш переживает рестарт сервиса.
         Между страницами throttle 1.5 сек.
         """
+        import json as _json
+        from pathlib import Path
+
         now = time.monotonic()
+        # 1. In-memory кеш (быстрый путь между запросами в одном процессе)
         if (
             WBClient._subjects_cache is not None
             and (now - WBClient._subjects_cache_at) < WBClient._subjects_cache_ttl
         ):
-            logger.info("WB subjects_tree: %d cached", len(WBClient._subjects_cache))
+            logger.info("WB subjects_tree: %d (memory cache)", len(WBClient._subjects_cache))
             return WBClient._subjects_cache
 
+        # 2. Disk-кеш (переживает рестарт)
+        cache_path = Path.home() / "cz-backend" / "cache" / f"wb_subjects_{locale}.json"
+        cache_ttl_disk = 6 * 3600  # 6 часов
+        if cache_path.exists():
+            try:
+                age = time.time() - cache_path.stat().st_mtime
+                if age < cache_ttl_disk:
+                    data = _json.loads(cache_path.read_text("utf-8"))
+                    if isinstance(data, list) and data:
+                        WBClient._subjects_cache = data
+                        WBClient._subjects_cache_at = now
+                        logger.info("WB subjects_tree: %d (disk cache, age=%.0fs)", len(data), age)
+                        return data
+            except Exception as e:
+                logger.warning("WB disk cache read fail: %s", e)
+
+        # 3. Свежая загрузка
         out: list[dict] = []
         limit = 1000
         offset = 0
-        for page in range(20):  # safety: max 20k subjects
+        for page in range(20):
             if page > 0:
-                await asyncio.sleep(1.5)  # throttle between pages
+                await asyncio.sleep(1.5)
             data = await self._get("/content/v2/object/all",
                                    {"locale": locale, "limit": limit, "offset": offset})
             chunk = data.get("data") or []
@@ -121,7 +143,13 @@ class WBClient:
                 break
             offset += limit
         WBClient._subjects_cache = out
-        WBClient._subjects_cache_at = time.monotonic()
+        WBClient._subjects_cache_at = now
+        # Сохраняем на диск (best effort)
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(_json.dumps(out, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            logger.warning("WB disk cache write fail: %s", e)
         logger.info("WB subjects_tree: %d total subjects (fresh)", len(out))
         return out
 
