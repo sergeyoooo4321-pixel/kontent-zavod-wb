@@ -524,6 +524,17 @@ class KieAIClient:
                 data = r.json()
                 biz_code = data.get("code")
                 if biz_code is not None and biz_code != 200 and "output" not in data:
+                    # 5xx/429 на стороне kie — это transient (overload, прокси-флап).
+                    # Ретраим с back-off в пределах max_attempts. На 4xx-ошибках
+                    # клиента (400, 401, 403, 422) — сразу raise, ретрай не поможет.
+                    if biz_code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
+                        wait = min(2 ** attempt, 16)
+                        logger.warning(
+                            "responses_api attempt %d/%d kie biz %s (%s) — retry через %ds",
+                            attempt + 1, max_attempts, biz_code, data.get("msg"), wait,
+                        )
+                        await asyncio.sleep(wait)
+                        continue
                     raise KieAIError(
                         f"kie.ai biz error code={biz_code} msg={data.get('msg')!r} model={model!r}"
                     )
@@ -540,6 +551,8 @@ class KieAIClient:
             except httpx.HTTPError as e:
                 logger.warning("responses_api attempt %d/%d HTTP error: %s",
                                attempt + 1, max_attempts, str(e)[:200])
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(min(2 ** attempt, 16))
                 continue
             obj = _extract_json(last_content)
             if obj is not None:
