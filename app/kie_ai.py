@@ -450,7 +450,15 @@ class KieAIClient:
                         r = await self._request_with_429("POST", url, json=body, timeout=180.0)
                 r.raise_for_status()
                 data = r.json()
+                # kie.ai biz-error в теле при 200 OK — не ретраим
+                biz_code = data.get("code")
+                if biz_code is not None and biz_code != 200 and "choices" not in data:
+                    raise KieAIError(
+                        f"kie.ai biz error code={biz_code} msg={data.get('msg')!r} model={m!r}"
+                    )
                 last_content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            except KieAIError:
+                raise
             except httpx.HTTPError as e:
                 logger.warning("vision attempt %d/5 HTTP error: %s", attempt + 1, str(e)[:200])
                 continue
@@ -532,7 +540,18 @@ class KieAIClient:
                     r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
                 r.raise_for_status()
                 data = r.json()
+                # kie.ai иногда возвращает HTTP 200 с business-error в теле:
+                # {"code":422,"msg":"The model is not supported","data":null}.
+                # Это значит модель не существует / нет доступа — нет смысла ретраить.
+                biz_code = data.get("code")
+                if biz_code is not None and biz_code != 200 and "choices" not in data:
+                    raise KieAIError(
+                        f"kie.ai biz error code={biz_code} msg={data.get('msg')!r} model={m!r}"
+                    )
                 last_content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            except KieAIError:
+                # Бизнес-ошибка от kie (модель не поддерживается и т.п.) — не ретраим
+                raise
             except httpx.HTTPError as e:
                 logger.warning("chat_json attempt %d/5 HTTP error: %s", attempt + 1, str(e)[:200])
                 last_content = ""
