@@ -622,6 +622,7 @@ async def build_skus_and_texts(
                 llm_o = await deps.kie.chat_json(system=sys_o, user=usr_o)
                 attrs, warns = map_ozon_attributes(
                     llm_o, cat.ozon_attrs, cat.ozon_attr_values,
+                    brand_hint=state.brand,
                 )
                 state.attributes_ozon[sku] = attrs  # None если required не нашёлся
                 if attrs is None:
@@ -643,6 +644,7 @@ async def build_skus_and_texts(
                 llm_w = await deps.kie.chat_json(system=sys_w, user=usr_w)
                 charcs, warns = map_wb_characteristics(
                     llm_w, cat.wb_charcs, cat.wb_charc_values,
+                    brand_hint=state.brand,
                 )
                 state.characteristics_wb[sku] = charcs
                 if charcs is None:
