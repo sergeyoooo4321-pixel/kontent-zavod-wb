@@ -314,13 +314,20 @@ async def _build_zip(state: ProductState, deps: Deps) -> bytes:
 # ─── Этап 2: категории ───────────────────────────────────────────
 
 
-def _flatten_tree(tree: list[dict], path: str = "", is_ozon: bool = True) -> list[dict]:
+def _flatten_tree(
+    tree: list[dict],
+    path: str = "",
+    is_ozon: bool = True,
+    parent_cat_id: int | None = None,
+) -> list[dict]:
     """Сжимает дерево категорий (Ozon) или плоский список subjects (WB) в leaves.
 
-    Ozon: рекурсивный спуск по children/types, leaf = description_category_id+type_id.
-    WB: после фикса subjects_tree пришёл уже плоский список, у каждого элемента
-    subjectID + subjectName + parentName. Path = «parentName / subjectName»
-    для лучшего keyword-match.
+    Ozon: рекурсивный спуск по children/types. Для leaf-типа description_category_id
+    наследуется от ВЫШЕЛЕЖАЩЕЙ категории (это поле есть у уровня категории, а не типа).
+    На API import_products нужны ОБА id: category_id (description_category_id) и type_id.
+
+    WB: на входе уже плоский список subjects с {subjectID, subjectName, parentName}.
+    Path = «parentName / subjectName» для лучшего keyword-match.
     """
     out: list[dict] = []
     for n in tree:
@@ -328,14 +335,22 @@ def _flatten_tree(tree: list[dict], path: str = "", is_ozon: bool = True) -> lis
             name = n.get("category_name") or n.get("type_name") or ""
             children = n.get("children") or n.get("types") or []
             cur_path = f"{path} / {name}" if path else name
+            # description_category_id — есть только на уровне категории, не типа.
+            # Сохраняем самый глубокий встретившийся вниз по дереву.
+            this_cat_id = n.get("description_category_id")
+            cat_id_for_children = this_cat_id if this_cat_id is not None else parent_cat_id
             if children:
-                out.extend(_flatten_tree(children, cur_path, is_ozon))
+                out.extend(_flatten_tree(children, cur_path, is_ozon, cat_id_for_children))
             else:
-                out.append({
-                    "id": n.get("description_category_id") or n.get("type_id"),
-                    "type_id": n.get("type_id"),
-                    "path": cur_path,
-                })
+                # Leaf: type-узел; description_category_id берём от родителя
+                cat_id = this_cat_id if this_cat_id is not None else parent_cat_id
+                type_id = n.get("type_id")
+                if cat_id and type_id:
+                    out.append({
+                        "id": cat_id,
+                        "type_id": type_id,
+                        "path": cur_path,
+                    })
         else:
             # WB: плоский список subjects
             subj_id = n.get("subjectID") or n.get("subjectId")
@@ -350,21 +365,19 @@ def _filter_leaves_by_keywords(name: str, leaves: list[dict], top_n: int = 50) -
     """Pre-фильтр листовых категорий по словам из названия товара.
 
     Простой scoring: сколько слов из name (≥3 символов) содержатся в leaf.path.
-    Возвращает top-N с ненулевым score; если все scores 0 — возвращает первые top-N.
-    ВАЖНО: фильтруем leaves с пустым id — они нам бесполезны для подстановки CategoryRef.
+    Возвращает top-N с ненулевым score; если ничего не совпало — возвращает [].
+    Лучше пусто, чем рандом «3D Ручки» для стирального порошка.
     """
     import re
     words = {w.lower() for w in re.findall(r"[\wа-яА-ЯёЁ]{3,}", name)}
-    valid = [l for l in leaves if l.get("id")]  # только leaves с непустым id
+    valid = [l for l in leaves if l.get("id")]
     scored: list[tuple[int, dict]] = []
     for leaf in valid:
         path = (leaf.get("path") or "").lower()
         score = sum(1 for w in words if w in path)
-        scored.append((score, leaf))
+        if score > 0:
+            scored.append((score, leaf))
     scored.sort(key=lambda x: -x[0])
-    nonzero = [l for s, l in scored if s > 0][:top_n]
-    if nonzero:
-        return nonzero
     return [l for _, l in scored[:top_n]]
 
 
