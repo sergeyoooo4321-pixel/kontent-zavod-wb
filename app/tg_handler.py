@@ -65,7 +65,7 @@ def _reset_partial(chat_id: int) -> TgSession:
 
 # Канон названий кнопок — собраны в одном месте чтобы не разъезжалось
 BTN_NEW_BATCH = "📦 Новая партия"
-BTN_GNOME = "🎨 Гном-генерация"
+BTN_GNOME = "🧙 Чат с гномом"
 BTN_CABINET_PREFIX = "🏪 Кабинет:"  # динамический суффикс
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_HELP = "ℹ️ Помощь"
@@ -123,14 +123,12 @@ def _kb(rows: list[list[str]]) -> dict:
 def _kb_main(s: TgSession) -> dict:
     return _kb([
         [BTN_NEW_BATCH, BTN_GNOME],
-        [_btn_cabinet_top(s)],
-        [BTN_SETTINGS, BTN_HELP],
+        [BTN_SETTINGS],
     ])
 
 
 def _kb_gnome() -> dict:
     return _kb([
-        [BTN_GNOME_RESET],
         [BTN_BACK],
     ])
 
@@ -152,12 +150,15 @@ def _kb_cabinets() -> dict:
     return _kb(rows)
 
 
-def _kb_settings() -> dict:
+def _kb_settings(s: TgSession) -> dict:
     dry_btn = ("⚙️ DRY_RUN: ✅ вкл (нажми чтобы выключить)"
                if settings.DRY_RUN
                else "⚙️ DRY_RUN: ❌ выкл (нажми чтобы ВКЛ-чить)")
     return _kb([
+        [_btn_cabinet_top(s)],
         [dry_btn],
+        [BTN_HELP],
+        [BTN_RESET, BTN_GNOME_RESET],
         [BTN_BACK],
     ])
 
@@ -234,11 +235,11 @@ def _main_menu_text(s: TgSession) -> str:
     cab = _cabinet_label(s.cabinet)
     return (
         "🏭 *Контент-завод*\n\n"
-        f"🏪 Кабинет: *{cab}*\n"
-        f"⚙️ DRY\\_RUN: *{_dry_text()}*\n\n"
-        "_DRY\\_RUN — заглушка. Когда вкл — карточки на МП НЕ публикуются, "
-        "а в чат приходит JSON с тем что бы ушло._\n\n"
-        "🧙 _Можешь писать мне обычным текстом — я Гномик, отвечу._"
+        f"🏪 Кабинет: *{cab}*  •  ⚙️ DRY\\_RUN: *{_dry_text()}*\n\n"
+        "*📦 Новая партия* — собрать пачку фото и названий, залить карточки.\n"
+        "*🧙 Чат с гномом* — кинуть фото и обсудить с гномом, или просто общаться.\n"
+        "*⚙️ Настройки* — кабинет, DRY\\_RUN, помощь, сброс партии.\n\n"
+        "_Любой текст в этом меню тоже уходит гному — он ответит._"
     )
 
 
@@ -334,7 +335,7 @@ async def _show_settings(deps, chat_id: int, s: TgSession) -> None:
         "JSON-документом — карточки в кабинетах НЕ создаются. Когда выключишь — "
         "карточки реально создадутся через API._"
     )
-    await _send(deps, chat_id, text, kb=_kb_settings())
+    await _send(deps, chat_id, text, kb=_kb_settings(s))
 
 
 def _help_text() -> str:
@@ -495,23 +496,18 @@ async def _handle_message(msg: dict, deps) -> None:
                 "Когда все — жми «✅ Готово, к названиям».",
                 kb=_kb_photos())
             return
-        if text.startswith(BTN_CABINET_PREFIX):
-            s.phase = "cabinet_select"
-            await _show_cabinet_menu(deps, chat_id)
-            return
         if text == BTN_SETTINGS:
             s.phase = "settings"
             await _show_settings(deps, chat_id, s)
             return
-        # «🎨 Гном-генерация» — переключаемся в чат с гномом
         if text == BTN_GNOME:
             s.phase = "gnome_chat"
             await _send(deps, chat_id,
-                "🎨 *Режим Гнома.*\n\n"
-                "Кидай фото товара и пиши что это (бренд, артикул, название). "
-                "Я сгенерирую варианты упаковки, спрошу одобрения, потом "
-                "соберу карточку.\n\n"
-                "Можешь и просто болтать — я помню разговор.",
+                "🧙 *Чат с гномом.*\n\n"
+                "Кидай фото и пиши что это (бренд, артикул, название) — я сделаю "
+                "варианты упаковки, спрошу одобрения и соберу карточку. "
+                "Или просто разговаривай — я помню контекст и могу заглянуть в код "
+                "и логи проекта если попросишь.",
                 kb=_kb_gnome())
             return
         # любой произвольный текст в idle — переадресуем гному
@@ -530,20 +526,19 @@ async def _handle_message(msg: dict, deps) -> None:
     if s.phase == "cabinet_select":
         if text == BTN_CABINET_ALL:
             s.cabinet = "all"
-            s.phase = "idle"
+            s.phase = "settings"
             await _send(deps, chat_id,
-                "🔄 Выбран *mirror-режим* — следующая партия зальётся "
-                "во ВСЕ настроенные кабинеты одним прогоном.",
-                kb=_kb_main(s))
+                "🔄 Выбран *mirror-режим* — партия зальётся во ВСЕ кабинеты.",
+                kb=_kb_settings(s))
             return
         # сравним по началу строки (точные label кабинетов в кнопках)
         for c in settings.list_cabinets():
             if text.startswith(c.label):
                 s.cabinet = c.name
-                s.phase = "idle"
+                s.phase = "settings"
                 await _send(deps, chat_id,
                     f"✅ Кабинет: *{c.label}*",
-                    kb=_kb_main(s))
+                    kb=_kb_settings(s))
                 return
         # не распознали — повторим
         await _show_cabinet_menu(deps, chat_id)
@@ -554,6 +549,19 @@ async def _handle_message(msg: dict, deps) -> None:
             settings.DRY_RUN = not settings.DRY_RUN
             logger.info("DRY_RUN toggled to %s by chat=%s", settings.DRY_RUN, chat_id)
             await _show_settings(deps, chat_id, s)
+            return
+        if text.startswith(BTN_CABINET_PREFIX):
+            s.phase = "cabinet_select"
+            await _show_cabinet_menu(deps, chat_id)
+            return
+        if text == BTN_HELP:
+            await _send(deps, chat_id, _help_text(), kb=_kb_settings(s))
+            return
+        if text == BTN_GNOME_RESET:
+            ok = await _gnome_reset(deps, chat_id)
+            msg_txt = "🧙 История разговора с гномом очищена." if ok \
+                      else "🧙 Не получилось сбросить разговор."
+            await _send(deps, chat_id, msg_txt, kb=_kb_settings(s))
             return
         # не распознали — повторим
         await _show_settings(deps, chat_id, s)
@@ -659,12 +667,6 @@ async def _handle_message(msg: dict, deps) -> None:
         return
 
     if s.phase == "gnome_chat":
-        # Очистить разговор с гномом
-        if text == BTN_GNOME_RESET:
-            await _gnome_reset(deps, chat_id)
-            await _send(deps, chat_id, "🧙 Очистил историю. Начнём заново.", kb=_kb_gnome())
-            return
-
         # Фото в режиме гнома: качаем → S3 → URL → гному с vision
         if has_image:
             try:
