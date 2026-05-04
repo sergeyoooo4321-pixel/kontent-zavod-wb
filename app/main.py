@@ -47,6 +47,7 @@ async def lifespan(app: FastAPI):
         http=http,
         image_model=settings.KIE_IMAGE_MODEL,
         llm_model=settings.KIE_LLM_MODEL,
+        llm_fallback_model=settings.KIE_LLM_FALLBACK_MODEL,
         poll_interval=settings.KIE_POLL_INTERVAL_SEC,
         poll_max_attempts=settings.KIE_POLL_MAX_ATTEMPTS,
         max_concurrent=settings.KIE_MAX_CONCURRENT,

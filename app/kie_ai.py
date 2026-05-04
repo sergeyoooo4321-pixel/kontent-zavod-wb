@@ -64,6 +64,7 @@ class KieAIClient:
         http: httpx.AsyncClient,
         image_model: str = "gpt-image-2-image-to-image",
         llm_model: str = "gpt-5-2",
+        llm_fallback_model: str = "gpt-4o-mini",
         poll_interval: float = 5.0,
         poll_max_attempts: int = 60,
         max_concurrent: int = 6,
@@ -79,6 +80,7 @@ class KieAIClient:
         }
         self._image_model = image_model
         self._llm_model = llm_model
+        self._llm_fallback_model = llm_fallback_model
         self._poll_interval = poll_interval
         self._poll_max_attempts = poll_max_attempts
         # Глобальный семафор concurrent createTask
@@ -416,11 +418,20 @@ class KieAIClient:
         max_tokens: int | None = None,
     ) -> dict:
         """OpenAI-совместимый chat/completions с response_format=json_object.
-        Парсит content как JSON, при невалидности — один retry с подсказкой."""
-        m = model or self._llm_model
-        url = f"{self._base}/{m}/v1/chat/completions"
 
-        async def _call(extra_user: str = "") -> str:
+        Стратегия:
+          1. Пробуем основную модель (model или self._llm_model).
+          2. При невалидном JSON — повторяем с подсказкой.
+          3. Если опять — пробуем fallback-модель (self._llm_fallback_model).
+          4. Если и она не отвечает — KieAIError.
+        Это лечит kie.ai outage конкретной модели — gpt-5-2 иногда возвращает
+        пустой content, тогда gpt-4o-mini обычно работает.
+        """
+        primary = model or self._llm_model
+        fallback = self._llm_fallback_model if primary != self._llm_fallback_model else None
+
+        async def _call_with_model(m: str, extra_user: str = "") -> str:
+            url = f"{self._base}/{m}/v1/chat/completions"
             body: dict[str, Any] = {
                 "model": m,
                 "response_format": {"type": "json_object"},
@@ -434,7 +445,6 @@ class KieAIClient:
                 body["max_tokens"] = max_tokens
             r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
             if r.status_code == 400 and "response_format" in r.text:
-                # Фолбэк: модель не поддерживает response_format → убираем
                 body.pop("response_format", None)
                 body["messages"][0]["content"] = system + "\n\nВажно: ответ ТОЛЬКО валидный JSON, без markdown."
                 r = await self._http.post(url, headers=self._headers, json=body, timeout=120.0)
@@ -443,14 +453,31 @@ class KieAIClient:
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
             return content
 
-        content = await _call()
+        # Попытка 1: основная модель
+        content = await _call_with_model(primary)
         try:
             return json.loads(_strip_json_markdown(content))
         except json.JSONDecodeError:
-            content = await _call(
-                "\n\nВажно: предыдущий ответ был невалидным JSON. Верни ТОЛЬКО JSON-объект без markdown-обёртки."
-            )
+            pass
+
+        # Попытка 2: основная модель с подсказкой
+        content = await _call_with_model(
+            primary,
+            "\n\nВажно: предыдущий ответ был невалидным JSON. Верни ТОЛЬКО JSON-объект без markdown-обёртки.",
+        )
+        try:
+            return json.loads(_strip_json_markdown(content))
+        except json.JSONDecodeError:
+            pass
+
+        # Попытка 3: fallback-модель (если она другая)
+        if fallback:
+            logger.warning("chat_json: %s не отвечает валидным JSON, пробуем fallback %s",
+                           primary, fallback)
             try:
+                content = await _call_with_model(fallback)
                 return json.loads(_strip_json_markdown(content))
-            except json.JSONDecodeError as e:
-                raise KieAIError(f"LLM returned non-JSON twice: {content[:300]}") from e
+            except (json.JSONDecodeError, httpx.HTTPError) as e:
+                logger.warning("chat_json fallback %s тоже фейл: %s", fallback, str(e)[:200])
+
+        raise KieAIError(f"LLM returned non-JSON twice (primary={primary}, fallback={fallback}): {content[:300]}")
