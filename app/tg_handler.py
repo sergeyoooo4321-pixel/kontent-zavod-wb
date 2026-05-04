@@ -228,12 +228,42 @@ def _main_menu_text(s: TgSession) -> str:
         f"🏪 Кабинет: *{cab}*\n"
         f"⚙️ DRY\\_RUN: *{_dry_text()}*\n\n"
         "_DRY\\_RUN — заглушка. Когда вкл — карточки на МП НЕ публикуются, "
-        "а в чат приходит JSON с тем что бы ушло._"
+        "а в чат приходит JSON с тем что бы ушло._\n\n"
+        "🧙 _Можешь писать мне обычным текстом — я Гномик, отвечу._"
     )
 
 
 async def _show_main_menu(deps, chat_id: int, s: TgSession) -> None:
     await _send(deps, chat_id, _main_menu_text(s), kb=_kb_main(s))
+
+
+# ─── мост к гному (cz-gnome.service на :8001) ─────────────────────
+
+
+_GNOME_URL = "http://127.0.0.1:8001/chat"
+
+
+async def _ask_gnome(deps, chat_id: int, text: str) -> str:
+    """Шлёт сообщение в cz-gnome.service и возвращает его ответ.
+
+    Гном живёт в ../gnome/ как отдельный сервис на :8001. Сессии у него
+    per chat_id, так что юзерская нить разговора сохраняется между
+    сообщениями автоматически.
+    """
+    try:
+        r = await deps.http.post(
+            _GNOME_URL,
+            json={"chat_id": chat_id, "text": text},
+            timeout=120.0,
+        )
+        if r.status_code >= 400:
+            logger.warning("gnome %s: %s", r.status_code, r.text[:200])
+            return f"🧙 Гном задумался: HTTP {r.status_code}"
+        data = r.json()
+        return (data.get("reply") or "").strip() or "🧙 Гном промолчал."
+    except Exception as e:
+        logger.warning("gnome bridge fail chat=%s: %s", chat_id, e)
+        return f"🧙 Гном недоступен: {str(e)[:120]}"
 
 
 async def _show_cabinet_menu(deps, chat_id: int) -> None:
@@ -283,6 +313,8 @@ def _help_text() -> str:
         "Безопасно тестить без публикации товаров.\n\n"
         "*◀️ Назад в меню* — возвращает в главное меню в любой момент.\n"
         "*🔄 Сбросить партию* — чистит все фото и названия (кабинет сохраняется).\n\n"
+        "*🧙 Гномик* — в главном меню (когда не идёт партия) пиши обычный текст и я отвечу. "
+        "Знаю про маркетплейсы, помогаю разобраться, помню наш разговор.\n\n"
         "Команды: `/start` `/help`"
     )
 
@@ -411,7 +443,16 @@ async def _handle_message(msg: dict, deps) -> None:
             s.phase = "settings"
             await _show_settings(deps, chat_id, s)
             return
-        # любое другое — показать меню
+        # любой произвольный текст в idle — переадресуем гному
+        if text and not text.startswith("/"):
+            try:
+                await deps.tg.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            reply = await _ask_gnome(deps, chat_id, text)
+            await _send(deps, chat_id, reply, kb=_kb_main(s), parse_mode=None)
+            return
+        # фото или иной не-текст — показать меню
         await _show_main_menu(deps, chat_id, s)
         return
 
