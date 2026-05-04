@@ -362,19 +362,29 @@ def _flatten_tree(
 
 
 def _filter_leaves_by_keywords(name: str, leaves: list[dict], top_n: int = 50) -> list[dict]:
-    """Pre-фильтр листовых категорий по словам из названия товара.
+    """Pre-фильтр листовых категорий по корням слов из названия товара.
 
-    Простой scoring: сколько слов из name (≥3 символов) содержатся в leaf.path.
-    Возвращает top-N с ненулевым score; если ничего не совпало — возвращает [].
-    Лучше пусто, чем рандом «3D Ручки» для стирального порошка.
+    Русские слова склоняются: «стиральный» в название → «стиральные» в категории.
+    Substring match не помогает. Обрезаем до 5 первых символов (русский корень)
+    и матчим prefix — «стира» совпадёт и со «стиральный», и со «стиральные».
+
+    Возвращает top-N по убыванию score; пусто, если ничего не нашлось
+    (лучше пусто, чем рандом).
     """
     import re
-    words = {w.lower() for w in re.findall(r"[\wа-яА-ЯёЁ]{3,}", name)}
+    # Стоп-слова которые ни о чём не говорят
+    stop = {"для", "под", "при", "над", "без", "над", "the", "and", "set", "kit"}
+    raw = [w.lower() for w in re.findall(r"[\wа-яА-ЯёЁ]{3,}", name)]
+    # Корни (5 первых символов)
+    roots = {w[:5] for w in raw if w not in stop and len(w) >= 4}
+    if not roots:
+        return []
     valid = [l for l in leaves if l.get("id")]
     scored: list[tuple[int, dict]] = []
     for leaf in valid:
         path = (leaf.get("path") or "").lower()
-        score = sum(1 for w in words if w in path)
+        # Бонус за каждое совпадение корня
+        score = sum(1 for r in roots if r in path)
         if score > 0:
             scored.append((score, leaf))
     scored.sort(key=lambda x: -x[0])
