@@ -315,30 +315,34 @@ async def _build_zip(state: ProductState, deps: Deps) -> bytes:
 
 
 def _flatten_tree(tree: list[dict], path: str = "", is_ozon: bool = True) -> list[dict]:
-    """Сжимает дерево категорий в плоский список листьев."""
+    """Сжимает дерево категорий (Ozon) или плоский список subjects (WB) в leaves.
+
+    Ozon: рекурсивный спуск по children/types, leaf = description_category_id+type_id.
+    WB: после фикса subjects_tree пришёл уже плоский список, у каждого элемента
+    subjectID + subjectName + parentName. Path = «parentName / subjectName»
+    для лучшего keyword-match.
+    """
     out: list[dict] = []
     for n in tree:
         if is_ozon:
             name = n.get("category_name") or n.get("type_name") or ""
             children = n.get("children") or n.get("types") or []
-        else:
-            name = n.get("subjectName") or n.get("parentName") or ""
-            children = n.get("childs") or n.get("children") or []
-        cur_path = f"{path} / {name}" if path else name
-        if children:
-            out.extend(_flatten_tree(children, cur_path, is_ozon))
-        else:
-            if is_ozon:
+            cur_path = f"{path} / {name}" if path else name
+            if children:
+                out.extend(_flatten_tree(children, cur_path, is_ozon))
+            else:
                 out.append({
                     "id": n.get("description_category_id") or n.get("type_id"),
                     "type_id": n.get("type_id"),
                     "path": cur_path,
                 })
-            else:
-                out.append({
-                    "id": n.get("subjectID") or n.get("subjectId"),
-                    "path": cur_path,
-                })
+        else:
+            # WB: плоский список subjects
+            subj_id = n.get("subjectID") or n.get("subjectId")
+            subj_name = n.get("subjectName") or ""
+            parent = n.get("parentName") or ""
+            full_path = f"{parent} / {subj_name}" if parent else subj_name
+            out.append({"id": subj_id, "path": full_path})
     return out
 
 

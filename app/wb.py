@@ -72,9 +72,29 @@ class WBClient:
     # ─── категории/предметы ─────────────────────────────────
 
     async def subjects_tree(self, locale: str = "ru") -> list[dict]:
-        """GET /content/v2/object/parent/all?locale=ru."""
-        data = await self._get("/content/v2/object/parent/all", {"locale": locale})
-        return data.get("data") or []
+        """GET /content/v2/object/all — все листовые subjects (предметы).
+
+        WB API в v2 разделяет: /object/parent/all возвращает ~80 родительских
+        групп БЕЗ subjectID (это для UI-фильтров), а /object/all — реальные
+        subjects (~4000+) с настоящими subjectID, которые нужны для cards/upload.
+
+        Пагинируем по 1000, пока не получим меньше limit (значит конец).
+        """
+        out: list[dict] = []
+        limit = 1000
+        offset = 0
+        for _ in range(20):  # safety: max 20k subjects
+            data = await self._get("/content/v2/object/all",
+                                   {"locale": locale, "limit": limit, "offset": offset})
+            chunk = data.get("data") or []
+            if not chunk:
+                break
+            out.extend(chunk)
+            if len(chunk) < limit:
+                break
+            offset += limit
+        logger.info("WB subjects_tree: %d total subjects", len(out))
+        return out
 
     async def subject_charcs(self, subject_id: int, locale: str = "ru") -> list[dict]:
         """GET /content/v2/object/charcs/{id}?locale=ru."""
