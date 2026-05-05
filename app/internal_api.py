@@ -428,6 +428,47 @@ def _det_value_for_sku(
     return None
 
 
+async def _resolve_category_path(spec, deps: Deps) -> str:
+    """Возвращает читаемый путь категории для поля «Категория продавца».
+
+    Приоритет:
+      1. Ozon + есть category_id → ищем в дереве категорий (с кешем).
+      2. Имя файла шаблона без расширения (например «Стиральные порошки»).
+      3. Пусто.
+    """
+    from pathlib import Path
+
+    if spec.marketplace == "ozon" and spec.category_id and deps.ozon is not None:
+        try:
+            tree = await deps.ozon.category_tree()
+            path = _find_ozon_path_by_id(tree, int(spec.category_id))
+            if path:
+                return path
+        except Exception as e:
+            logger.warning("ozon category tree resolve failed: %s", e)
+
+    raw = getattr(spec, "raw_path", "") or ""
+    if raw:
+        return Path(raw).stem.strip()
+    return ""
+
+
+def _find_ozon_path_by_id(tree: list[dict], target_id: int, prefix: str = "") -> str:
+    """Рекурсивный поиск Ozon-категории по description_category_id."""
+    for n in tree:
+        name = n.get("category_name") or n.get("type_name") or ""
+        cur = f"{prefix} / {name}" if prefix else name
+        cat_id = n.get("description_category_id")
+        if cat_id and int(cat_id) == target_id:
+            return cur
+        children = n.get("children") or n.get("types") or []
+        if children:
+            found = _find_ozon_path_by_id(children, target_id, cur)
+            if found:
+                return found
+    return ""
+
+
 @router.post("/fill_excel_batch", response_model=FillExcelBatchOut)
 async def fill_excel_batch_endpoint(
     req: FillExcelBatchIn,
@@ -490,8 +531,22 @@ async def fill_excel_batch_endpoint(
     if not sku_rows:
         return FillExcelBatchOut(ok=False, state="error", error="продуктов нет")
 
-    # 3. Заполняем по полям шаблона
-    category_path = ""  # TODO: подтягивать из category_id если есть
+    # 3. Резолвим category_path по category_id (Ozon) или из имени файла шаблона
+    deps: Deps = request.app.state.deps
+    category_path = await _resolve_category_path(spec, deps)
+
+    # 3b. Подтягиваем cached answers per-product (по бренду+имени)
+    from .decision_cache import append_cache, read_cached_answers
+    cabinet_norm = (req.cabinet or "default").strip() or "default"
+    cached_per_sku: dict[str, dict[str, str]] = {}
+    for product in req.products:
+        cached = read_cached_answers(
+            cabinet_norm, spec.marketplace, product.brand, product.name,
+        )
+        # Распространяем cached на все 3 SKU этого product
+        for sku_row in sku_rows:
+            if sku_row["_product"].sku == product.sku:
+                cached_per_sku[sku_row["sku"]] = cached
     pending: list[PendingQuestion] = []
     filled_rows: list[dict[int, str]] = []  # для каждого SKU: column → value
 
@@ -499,6 +554,7 @@ async def fill_excel_batch_endpoint(
         product: ProductInput = sku_row["_product"]
         parsed = sku_row["_parsed"]
         row_values: dict[int, str] = {}
+        cached = cached_per_sku.get(sku_row["sku"], {})
         for field in spec.fields:
             field_key = _resolve_field_key(field.name)
             value: str | None = None
@@ -516,6 +572,10 @@ async def fill_excel_batch_endpoint(
                     field_key, sku_row, parsed, product,
                     spec.marketplace, category_path,
                 )
+
+            # 3b'. Иначе — из persistent cache decisions.jsonl
+            if (value is None or value == "") and field.name in cached:
+                value = cached[field.name]
 
             # 3c. Если поле required и до сих пор пусто — pending
             if (value is None or value == "") and field.required:
@@ -570,6 +630,27 @@ async def fill_excel_batch_endpoint(
         logger.exception("fill_excel_batch save failed")
         return FillExcelBatchOut(ok=False, state="error",
                                  error=f"save failed: {str(e)[:200]}")
+
+    # 6. Записываем в persistent cache те answers что юзер дал в этой партии
+    #    (только настоящие user-answers, не наши авто-fill).
+    for product in req.products:
+        # собираем по всем 3 SKU этого продукта
+        merged: dict[str, str] = {}
+        for sku_row in sku_rows:
+            if sku_row["_product"].sku != product.sku:
+                continue
+            sku = sku_row["sku"]
+            prefix = f"{sku}::"
+            for k, v in (req.answers or {}).items():
+                if k.startswith(prefix) and v:
+                    field_name = k[len(prefix):]
+                    merged[field_name] = v
+        if merged:
+            try:
+                append_cache(cabinet_norm, spec.marketplace,
+                             product.brand, product.name, merged)
+            except Exception as e:
+                logger.warning("cache append fail %s: %s", product.sku, e)
 
     return FillExcelBatchOut(
         ok=True, state="filled",

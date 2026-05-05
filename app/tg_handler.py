@@ -445,6 +445,30 @@ def _extract_image_file_id(msg: dict) -> str | None:
     return None
 
 
+def _extract_xlsx_doc(msg: dict) -> tuple[str, str] | None:
+    """Возвращает (file_id, filename) для xlsx-документа из message.
+
+    Используется в gnome_chat фазе для загрузки шаблонов Ozon/WB которые
+    юзер шлёт как Document.
+    """
+    doc = msg.get("document") or {}
+    fid = doc.get("file_id")
+    if not fid:
+        return None
+    fname = (doc.get("file_name") or "").strip()
+    mime = (doc.get("mime_type") or "").lower()
+    is_xlsx = (
+        fname.lower().endswith(".xlsx")
+        or "spreadsheetml" in mime
+        or "openxmlformats-officedocument" in mime
+    )
+    if not is_xlsx:
+        return None
+    if not fname:
+        fname = f"template_{int(time.time())}.xlsx"
+    return fid, fname
+
+
 async def _handle_message(msg: dict, deps) -> None:
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
@@ -667,6 +691,53 @@ async def _handle_message(msg: dict, deps) -> None:
         return
 
     if s.phase == "gnome_chat":
+        # xlsx-документ — сохраняем локально и сообщаем гному путь
+        xlsx = _extract_xlsx_doc(msg)
+        if xlsx is not None:
+            file_id, filename = xlsx
+            try:
+                await deps.tg.send_chat_action(chat_id, "upload_document")
+            except Exception:
+                pass
+            try:
+                raw = await deps.tg.get_file_bytes(file_id)
+            except Exception as e:
+                await _send(deps, chat_id, f"Не смог скачать xlsx: {e}", kb=_kb_gnome())
+                return
+            from pathlib import Path
+            uploads_dir = Path.home() / "cz-backend" / "uploads" / str(chat_id)
+            uploads_dir.mkdir(parents=True, exist_ok=True)
+            # Если файл с таким именем уже есть — добавляем суффикс времени.
+            xlsx_path = uploads_dir / filename
+            if xlsx_path.exists():
+                stem = xlsx_path.stem
+                suffix = xlsx_path.suffix
+                xlsx_path = uploads_dir / f"{stem}_{int(time.time())}{suffix}"
+            try:
+                xlsx_path.write_bytes(raw)
+            except Exception as e:
+                await _send(deps, chat_id, f"Не смог сохранить xlsx: {e}", kb=_kb_gnome())
+                return
+            size_kb = len(raw) // 1024
+            await _send(deps, chat_id,
+                f"📋 xlsx сохранил ({size_kb} КБ). Передаю гному путь.",
+                kb=_kb_gnome(), parse_mode=None)
+            try:
+                await deps.tg.send_chat_action(chat_id, "typing")
+            except Exception:
+                pass
+            note = (
+                f"Юзер прислал xlsx-шаблон. Я (бот) сохранил его на сервере "
+                f"по абсолютному пути: {xlsx_path}. "
+                f"Имя файла: {filename}. "
+                "Можешь распарсить через скилл parse_template."
+            )
+            if text:
+                note += f"\n\nКомментарий юзера: {text}"
+            reply, approval = await _ask_gnome(deps, chat_id, note)
+            await _send_gnome_reply(deps, chat_id, reply, approval, _kb_gnome())
+            return
+
         # Фото в режиме гнома: качаем → S3 → URL → гному с vision
         if has_image:
             try:
