@@ -1,0 +1,24 @@
+name: deliver_excel
+description: |
+  Отправить готовый xlsx-файл юзеру в Telegram. Используется после
+  fill_excel_batch когда state="filled" и есть xlsx_path. Юзер получает
+  документ с подписью и сам грузит в кабинет МП через UI массовой загрузки.
+
+  chat_id берётся из контекста (ctx.chat_id), не нужен в params. Если
+  caption не передан — будет имя файла с эмодзи 📋.
+version: 0.1.0
+input_schema:
+  type: object
+  properties:
+    xlsx_path:
+      type: string
+      description: Абсолютный путь к xlsx (обычно из fill_excel_batch.xlsx_path).
+    caption:
+      type: string
+      description: Подпись к документу. По умолчанию имя файла.
+    filename:
+      type: string
+      description: Переопределить имя при отправке (необязательно).
+  required: [xlsx_path]
+permissions: []
+requires_approval: false
