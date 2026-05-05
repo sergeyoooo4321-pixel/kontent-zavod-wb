@@ -8,13 +8,10 @@ description: |
 
   Используй когда юзер дал тебе все фото и названия и сказал «поехали».
   Перед вызовом перепроверь что у каждого товара есть src_url, sku, name, brand.
-version: 0.3.0
+version: 0.4.0
 input_schema:
   type: object
   properties:
-    chat_id:
-      type: integer
-      description: Telegram chat_id юзера — туда пайплайн будет слать прогресс
     products:
       type: array
       description: Список товаров партии, до 10 штук
@@ -43,7 +40,6 @@ input_schema:
       items:
         type: string
   required:
-    - chat_id
     - products
 permissions: []
 requires_approval: true

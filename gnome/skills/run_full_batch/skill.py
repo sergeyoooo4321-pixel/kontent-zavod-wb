@@ -9,7 +9,9 @@ import httpx
 async def run(params: dict, ctx) -> dict:
     backend = os.environ.get("BACKEND_URL", "http://127.0.0.1:8000")
     token = os.environ.get("INTERNAL_TOKEN", "")
-    chat_id = params.get("chat_id") or ctx.chat_id
+    # chat_id берём ТОЛЬКО из ctx (текущая сессия), не из params — иначе LLM
+    # может перепутать с sku/артикулом и отправить пайплайн «не в тот чат»
+    chat_id = ctx.chat_id
     products = params.get("products") or []
     if not products:
         return {"ok": False, "error": "products пустой"}
