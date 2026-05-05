@@ -200,3 +200,93 @@ class WBClient:
             if cards:
                 return data
         raise WBError(f"upload_wait timeout for {len(vendor_codes)} vendor_codes")
+
+    async def list_upload_errors(self) -> list[dict]:
+        """POST /content/v2/cards/error/list — карточки которые не прошли валидацию.
+
+        КРИТИЧНО для надёжной заливки: WB возвращает HTTP 200 на /cards/upload
+        даже когда карточка свалилась — настоящие ошибки лежат тут. Опрашивать
+        через 5-30 сек после upload, читать поле `errors` по каждому
+        vendorCode'у. Если vendorCode сюда попал — карточка попала в Черновики
+        и НЕ опубликована.
+        """
+        data = await self._post("/content/v2/cards/error/list", {})
+        return data.get("data") or []
+
+    async def upload_wait_with_errors(
+        self,
+        vendor_codes: list[str],
+        *,
+        interval: float = 5.0,
+        max_attempts: int = 12,
+    ) -> dict:
+        """Двухфазный poll: ждём появления карточек ИЛИ появления их в error/list.
+
+        Возвращает dict:
+          {
+            "succeeded": [{vendorCode, nmID}, ...],
+            "failed":    [{vendorCode, errors: [str], updateAt}, ...],
+            "pending":   [vendorCode, ...]   # ни тут, ни там
+          }
+        """
+        wanted = set(vendor_codes)
+        succeeded: list[dict] = []
+        failed: list[dict] = []
+        seen_succeeded: set[str] = set()
+        seen_failed: set[str] = set()
+
+        for _ in range(max_attempts):
+            await asyncio.sleep(interval)
+            # 1) Список с ошибками (Черновики)
+            try:
+                err_items = await self.list_upload_errors()
+            except WBError as e:
+                logger.warning("error/list fail: %s", e)
+                err_items = []
+            for item in err_items:
+                vc = item.get("vendorCode") or item.get("object", {}).get("vendorCode")
+                if vc in wanted and vc not in seen_failed:
+                    failed.append({
+                        "vendorCode": vc,
+                        "errors": item.get("errors") or [],
+                        "updateAt": item.get("updateAt") or item.get("updatedAt"),
+                    })
+                    seen_failed.add(vc)
+            # 2) Список созданных карточек
+            try:
+                status = await self.upload_status(list(wanted))
+                cards = status.get("data", {}).get("cards") or []
+            except WBError as e:
+                logger.warning("upload_status fail: %s", e)
+                cards = []
+            for c in cards:
+                vc = c.get("vendorCode")
+                if vc in wanted and vc not in seen_succeeded and vc not in seen_failed:
+                    nm = None
+                    for sz in (c.get("sizes") or []):
+                        if sz.get("chrtID") or sz.get("nmID"):
+                            nm = sz.get("nmID") or c.get("nmID")
+                            break
+                    succeeded.append({"vendorCode": vc, "nmID": nm or c.get("nmID")})
+                    seen_succeeded.add(vc)
+            # Если все vendor_codes разобрались (succeeded ∪ failed = wanted) — выходим
+            if (seen_succeeded | seen_failed) >= wanted:
+                break
+        pending = [v for v in vendor_codes if v not in seen_succeeded and v not in seen_failed]
+        return {"succeeded": succeeded, "failed": failed, "pending": pending}
+
+    # ─── загрузка картинок (отдельным запросом ПОСЛЕ карточки) ──────────
+
+    async def media_save(self, *, nm_id: int, image_urls: list[str]) -> dict:
+        """POST /content/v3/media/save — заливка картинок по URL для nmID.
+
+        КРИТИЧНО: WB ждёт что картинки будут залиты ОТДЕЛЬНЫМ запросом, ПОСЛЕ
+        успешного создания карточки (когда уже есть nmID). Если слать
+        картинки в `/cards/upload` — приходит ошибка
+        «no product card found for this article».
+
+        Требования к URL: только https, без редиректов, без presigned-query,
+        путь должен заканчиваться на `.jpg|.jpeg|.png`. Минимум 900×1200, ≤10 МБ.
+        """
+        body = {"nmId": int(nm_id), "data": list(image_urls)}
+        return await self._post("/content/v3/media/save", body)

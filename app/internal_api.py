@@ -870,3 +870,99 @@ async def deliver_excel_endpoint(
         return DeliverExcelOut(ok=False, error=f"telegram: {str(e)[:200]}")
 
     return DeliverExcelOut(ok=True, sent_filename=fname, size_bytes=len(content))
+
+
+# ─── /internal/run_full_batch ──────────────────────────────────────
+
+
+class RunBatchProductIn(BaseModel):
+    sku: str
+    name: str
+    brand: str | None = None
+    src_url: str  # фото уже в S3 (bridge или гном залил)
+    weight_g: int | None = None
+    dims: dict[str, float] | None = None  # {"l":..,"w":..,"h":..}
+
+
+class RunBatchIn(BaseModel):
+    chat_id: int
+    products: list[RunBatchProductIn]
+    cabinet_names: list[str] | None = None  # None = default; ["all"] не поддерживаем
+    dry_run: bool | None = None  # None = берём из settings
+
+
+class RunBatchOut(BaseModel):
+    ok: bool
+    batch_id: str
+    queued: bool
+    products_count: int
+    cabinets: list[str]
+    dry_run: bool
+    note: str = ""
+
+
+@router.post("/run_full_batch", response_model=RunBatchOut)
+async def run_full_batch_endpoint(
+    req: RunBatchIn,
+    request: Request,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+):
+    """Запускает полный pipeline партии в фоне. Возвращается сразу с batch_id.
+
+    Прогресс уходит юзеру в чат через `deps.tg.send` из `pipeline.run_batch`
+    (типовые сообщения: «📥 фото в S3», «🎨 identity», тайминги этапов,
+    финальный отчёт). Гному ничего ждать не надо.
+    """
+    _check_token(x_internal_token)
+    if not req.products:
+        raise HTTPException(status_code=400, detail="products пустой")
+    if len(req.products) > 10:
+        raise HTTPException(status_code=400,
+                            detail="максимум 10 товаров на партию (см. ТЗ §1)")
+
+    deps: Deps = request.app.state.deps
+    from .models import ProductIn, RunRequest
+    from .pipeline import run_batch
+    import asyncio
+
+    products = [
+        ProductIn(
+            idx=i,
+            sku=p.sku,
+            name=p.name,
+            brand=p.brand,
+            tg_file_id="",      # фото уже в S3, не качаем из TG
+            src_url=p.src_url,
+            weight_g=p.weight_g,
+            dims=p.dims,
+        )
+        for i, p in enumerate(req.products)
+    ]
+    batch_id = f"gnome-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+    cabinet_names = req.cabinet_names or (
+        [settings.default_cabinet_name] if settings.default_cabinet_name else None
+    )
+    rr = RunRequest(
+        batch_id=batch_id,
+        chat_id=req.chat_id,
+        products=products,
+        cabinet_names=cabinet_names,
+    )
+
+    # DRY_RUN override на уровне текущего process'а: если запросили — временно
+    # включаем, восстанавливаем после старта таски (пока остаются в памяти,
+    # это потокоопасно если несколько батчей одновременно — пусть пока будет
+    # глобальный settings.DRY_RUN, override игнорим).
+    asyncio.create_task(run_batch(rr, deps))
+
+    cabs_used = cabinet_names or ["default"]
+    return RunBatchOut(
+        ok=True,
+        batch_id=batch_id,
+        queued=True,
+        products_count=len(products),
+        cabinets=cabs_used,
+        dry_run=settings.DRY_RUN,
+        note=("Партия запущена в фоне. Прогресс приходит в чат отдельными "
+              "сообщениями от пайплайна."),
+    )

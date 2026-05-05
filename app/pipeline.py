@@ -117,16 +117,21 @@ async def process_product_images(
     защищает упаковку от изменений.
     """
     async with sem:
-        # 1. скачать из TG → S3 (src) — это якорь идентичности на ВСЕ генерации
-        try:
-            raw = await deps.tg.get_file_bytes(state.tg_file_id)
-            src_key = S3Client.build_key(batch_id, state.sku, "src")
-            state.src_url = await deps.s3.put_public(src_key, raw, "image/jpeg")
-        except Exception as e:
-            from .telegram import _mask_token
-            msg = _mask_token(str(e))
-            state.errors.append(f"src: {msg}")
-            logger.error("src upload %s: %s", state.sku, msg)
+        # 1. скачать из TG → S3 (src). Если src_url уже задан (гном-flow,
+        # фотка пришла из S3 через bridge) — пропускаем TG-скачивание.
+        if not state.src_url and state.tg_file_id:
+            try:
+                raw = await deps.tg.get_file_bytes(state.tg_file_id)
+                src_key = S3Client.build_key(batch_id, state.sku, "src")
+                state.src_url = await deps.s3.put_public(src_key, raw, "image/jpeg")
+            except Exception as e:
+                from .telegram import _mask_token
+                msg = _mask_token(str(e))
+                state.errors.append(f"src: {msg}")
+                logger.error("src upload %s: %s", state.sku, msg)
+                return
+        if not state.src_url:
+            state.errors.append("src: ни tg_file_id, ни src_url не заданы")
             return
 
         try:
@@ -1102,17 +1107,60 @@ async def upload_wb(
             ))
         return rep
 
+    # vendorCode → собранные media URL (для последующего media_save)
+    vc_to_media: dict[str, list[str]] = {}
+    for imt in cards:
+        for v in imt.get("variants") or []:
+            vc = v.get("vendorCode")
+            if vc:
+                vc_to_media[vc] = list(v.get("mediaFiles") or [])
+            # mediaFiles в /cards/upload не нужны — WB их игнорирует здесь,
+            # картинки идут отдельным запросом /content/v3/media/save
+            v.pop("mediaFiles", None)
+
     try:
         await wb_client.upload_cards(cards)
-        status = await wb_client.upload_wait(vendor_codes)
-        for c in status.get("data", {}).get("cards") or []:
-            vc = c.get("vendorCode")
-            errs = c.get("errors") or []
-            if errs:
-                rep.errors.append(ReportItem(sku=vc, mp=cab_tag,
-                                             reason="; ".join(str(x) for x in errs)))
-            else:
+        # Двухфазный poll: ловим и созданные карточки, и провалившиеся
+        # (которые попадают в Черновики через /content/v2/cards/error/list).
+        # Это критично — раньше /cards/upload/list возвращал только успехи и
+        # мы не видели реальные ошибки валидации WB.
+        result = await wb_client.upload_wait_with_errors(vendor_codes)
+        succeeded = result.get("succeeded") or []
+        failed = result.get("failed") or []
+        pending = result.get("pending") or []
+
+        # Картинки — после успеха карточки, отдельным запросом
+        for s in succeeded:
+            vc = s.get("vendorCode")
+            nm = s.get("nmID")
+            urls = vc_to_media.get(vc) or []
+            if not nm or not urls:
                 rep.successes.append(ReportItem(sku=vc, mp=cab_tag))
+                continue
+            try:
+                await wb_client.media_save(nm_id=int(nm), image_urls=urls)
+                rep.successes.append(ReportItem(sku=vc, mp=cab_tag))
+            except WBError as e:
+                rep.warnings.append(ReportItem(
+                    sku=vc, mp=cab_tag,
+                    reason=f"карточка создана, но media_save упал: {str(e)[:200]}",
+                ))
+                rep.successes.append(ReportItem(sku=vc, mp=cab_tag))
+
+        for f in failed:
+            errs = f.get("errors") or []
+            reason = "; ".join(str(x) for x in errs) if errs else "в Черновиках"
+            rep.errors.append(ReportItem(
+                sku=f.get("vendorCode") or "",
+                mp=cab_tag,
+                reason=f"в Черновиках: {reason[:300]}",
+            ))
+
+        for vc in pending:
+            rep.warnings.append(ReportItem(
+                sku=vc, mp=cab_tag,
+                reason="не появилась ни в Черновиках, ни в каталоге за время poll'а",
+            ))
     except WBError as e:
         for vc in vendor_codes:
             rep.errors.append(ReportItem(sku=vc, mp=cab_tag, reason=str(e)))
