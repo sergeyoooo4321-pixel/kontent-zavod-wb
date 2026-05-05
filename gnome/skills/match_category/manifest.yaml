@@ -10,7 +10,9 @@ input_schema:
     name: { type: string }
     brand: { type: string }
     main_image_url: { type: string, description: "URL утверждённого main-фото" }
-    side: { type: string, enum: [ozon, wb, both], default: both }
+    side:
+      type: string
+      description: "Какая площадка: ozon, wb или both. По умолчанию both."
   required: [name]
 permissions: []
 requires_approval: false

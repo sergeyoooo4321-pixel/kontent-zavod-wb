@@ -35,10 +35,19 @@ input_schema:
             description: Вес одиночной единицы в граммах.
           dims:
             type: object
-            description: "Габариты в см: {l,w,h}"
+            description: "Габариты в см"
+            properties:
+              l: { type: number }
+              w: { type: number }
+              h: { type: number }
           images:
             type: object
-            description: "Tag → URL: {main, pack2, pack3, extra}"
+            description: "Tag → URL"
+            properties:
+              main: { type: string }
+              pack2: { type: string }
+              pack3: { type: string }
+              extra: { type: string }
         required: [sku, name]
     cabinet:
       type: string
@@ -46,8 +55,10 @@ input_schema:
     answers:
       type: object
       description: |
-        Накопленные ответы юзера: {field_id: answer}. На первом вызове передавай {}.
-        После ask_user_choice добавляй сюда {field_id (из pending): answer (текст)}.
+        Накопленные ответы юзера: ключ field_id → строка-ответ. На первом
+        вызове передавай {}. После ask_user_choice добавляй field_id с ответом.
+      additionalProperties:
+        type: string
     output_filename:
       type: string
       description: Имя выходного xlsx (с расширением). По умолчанию <шаблон>_filled.xlsx.

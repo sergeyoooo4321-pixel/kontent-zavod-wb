@@ -44,12 +44,11 @@ input_schema:
             type: number
             description: Confidence от 0 до 1. Опционально — будет показано как процент.
           id:
-            type: [string, integer]
-            description: Внутренний идентификатор (например, wb_subject_id). Не показывается юзеру.
+            type: string
+            description: Внутренний идентификатор как строка. Не показывается юзеру.
     allow_freetext:
       type: boolean
-      default: true
-      description: Добавлять ли последний пункт «Другое (введи свой вариант)».
+      description: Добавлять ли последний пункт «Другое (введи свой вариант)». По умолчанию true.
   required: [title, options]
 permissions: []
 requires_approval: true

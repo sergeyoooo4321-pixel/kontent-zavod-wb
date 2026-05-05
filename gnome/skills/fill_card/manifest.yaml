@@ -15,8 +15,15 @@ input_schema:
     images:
       type: object
       description: "Tag → URL, например {main: 'https://...', pack2: '...', ...}"
+      properties:
+        main: { type: string }
+        pack2: { type: string }
+        pack3: { type: string }
+        extra: { type: string }
     cabinet: { type: string, description: "Имя кабинета или null = default" }
-    dry_run: { type: boolean, default: true }
+    dry_run:
+      type: boolean
+      description: По умолчанию true (только payload, без публикации).
   required: [sku, name, images]
 permissions: []
 requires_approval: true
