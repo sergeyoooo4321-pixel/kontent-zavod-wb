@@ -35,6 +35,60 @@ def _check_token(token: str | None) -> None:
         raise HTTPException(status_code=403, detail="bad internal token")
 
 
+def _pick_wb_client(cabinet_name: str | None, deps: "Deps"):
+    """Выбрать WBClient по fallback-цепочке: указанный кабинет → default → любой
+    кабинет с WB_TOKEN. Справочники WB — глобальный каталог, любой валидный
+    токен подходит, поэтому fallback безопасен.
+
+    Возвращает (WBClient | None, used_label).
+    """
+    from .pipeline import _wb_client_for
+
+    # 1. Конкретный кабинет
+    if cabinet_name:
+        cab = settings.get_cabinet(cabinet_name)
+        if cab is not None and cab.has_wb:
+            client = _wb_client_for(cab, deps)
+            if client is not None:
+                return client, cab.label
+
+    # 2. Default
+    if deps.wb is not None:
+        return deps.wb, "default"
+
+    # 3. Любой кабинет с WB
+    for cab in settings.list_cabinets():
+        if cab.has_wb:
+            client = _wb_client_for(cab, deps)
+            if client is not None:
+                return client, cab.label
+
+    return None, ""
+
+
+def _pick_ozon_client(cabinet_name: str | None, deps: "Deps"):
+    """То же что _pick_wb_client, но для Ozon. Категории Ozon — глобальный каталог."""
+    from .pipeline import _ozon_client_for
+
+    if cabinet_name:
+        cab = settings.get_cabinet(cabinet_name)
+        if cab is not None and cab.has_ozon:
+            client = _ozon_client_for(cab, deps)
+            if client is not None:
+                return client, cab.label
+
+    if deps.ozon is not None:
+        return deps.ozon, "default"
+
+    for cab in settings.list_cabinets():
+        if cab.has_ozon:
+            client = _ozon_client_for(cab, deps)
+            if client is not None:
+                return client, cab.label
+
+    return None, ""
+
+
 # ─── /internal/generate_image ──────────────────────────────────────
 
 
@@ -428,24 +482,26 @@ def _det_value_for_sku(
     return None
 
 
-async def _resolve_category_path(spec, deps: Deps) -> str:
+async def _resolve_category_path(spec, deps: Deps, cabinet_name: str | None = None) -> str:
     """Возвращает читаемый путь категории для поля «Категория продавца».
 
     Приоритет:
-      1. Ozon + есть category_id → ищем в дереве категорий (с кешем).
+      1. Ozon + есть category_id → ищем в дереве категорий (с fallback по кабинетам).
       2. Имя файла шаблона без расширения (например «Стиральные порошки»).
       3. Пусто.
     """
     from pathlib import Path
 
-    if spec.marketplace == "ozon" and spec.category_id and deps.ozon is not None:
-        try:
-            tree = await deps.ozon.category_tree()
-            path = _find_ozon_path_by_id(tree, int(spec.category_id))
-            if path:
-                return path
-        except Exception as e:
-            logger.warning("ozon category tree resolve failed: %s", e)
+    if spec.marketplace == "ozon" and spec.category_id:
+        ozon_client, _ = _pick_ozon_client(cabinet_name, deps)
+        if ozon_client is not None:
+            try:
+                tree = await ozon_client.category_tree()
+                path = _find_ozon_path_by_id(tree, int(spec.category_id))
+                if path:
+                    return path
+            except Exception as e:
+                logger.warning("ozon category tree resolve failed: %s", e)
 
     raw = getattr(spec, "raw_path", "") or ""
     if raw:
@@ -533,7 +589,7 @@ async def fill_excel_batch_endpoint(
 
     # 3. Резолвим category_path по category_id (Ozon) или из имени файла шаблона
     deps: Deps = request.app.state.deps
-    category_path = await _resolve_category_path(spec, deps)
+    category_path = await _resolve_category_path(spec, deps, req.cabinet)
 
     # 3b. Подтягиваем cached answers per-product (по бренду+имени)
     from .decision_cache import append_cache, read_cached_answers
@@ -713,8 +769,12 @@ async def load_wb_dropdowns_endpoint(
         return LoadWbDropdownsOut(ok=False, error=f"не WB-шаблон: {spec.marketplace}")
 
     deps: Deps = request.app.state.deps
-    if deps.wb is None:
-        return LoadWbDropdownsOut(ok=False, error="WBClient не инициализирован (нет WB_TOKEN?)")
+    wb_client, used_label = _pick_wb_client(req.cabinet, deps)
+    if wb_client is None:
+        return LoadWbDropdownsOut(
+            ok=False,
+            error="ни в одном кабинете не настроен WB_TOKEN",
+        )
 
     # Идём по dictionary-полям (charcType 4/5). Дёргаем directory_values
     # для каждого charcID — у некоторых WB-эндпоинтов директория именная,
@@ -727,7 +787,7 @@ async def load_wb_dropdowns_endpoint(
         if not f.wb_charc_id:
             continue
         try:
-            vals = await deps.wb.directory_values(str(f.wb_charc_id))
+            vals = await wb_client.directory_values(str(f.wb_charc_id))
         except WBError as e:
             logger.warning("wb directory %s failed: %s", f.wb_charc_id, e)
             continue
