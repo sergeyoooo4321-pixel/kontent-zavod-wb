@@ -59,6 +59,27 @@ def _match_numeric_range(value: float, dict_strings: list[str]) -> str | None:
     return None
 
 
+def _match_closest_numeric(value: float, dict_strings: list[str]) -> str | None:
+    """Если словарь — список конкретных чисел («100», «200», «500», «1000»),
+    выбираем ближайшее к value по абсолютной разнице.
+
+    Используется когда ни точное совпадение (pick_from_dict), ни диапазонный
+    матч (_match_numeric_range) не сработали. Возвращает None если в словаре
+    нет ни одного числа.
+    """
+    best_str: str | None = None
+    best_diff: float | None = None
+    for s in dict_strings:
+        n = _try_number(s)
+        if n is None:
+            continue
+        d = abs(n - value)
+        if best_diff is None or d < best_diff:
+            best_diff = d
+            best_str = s
+    return best_str
+
+
 def _to_list(raw: Any) -> list[str]:
     """Нормализация LLM-значения к списку строк."""
     if raw is None or raw == "":
@@ -67,6 +88,43 @@ def _to_list(raw: Any) -> list[str]:
         return [str(x).strip() for x in raw if x not in (None, "") and str(x).strip()]
     s = str(raw).strip()
     return [s] if s else []
+
+
+def _resolve_value(
+    raw: str,
+    dict_strings: list[str],
+    warnings: list[str],
+    ctx: str,
+) -> tuple[str | None, bool]:
+    """Найти значение из словаря под LLM-сырое.
+
+    Порядок:
+      1. Если raw — число и словарь содержит диапазоны — numeric-range.
+      2. Если raw — число и словарь содержит конкретные числа — closest-numeric.
+      3. Иначе — Левенштейн (rules.pick_from_dict).
+
+    Числовое сопоставление приоритетнее, потому что Левенштейн «300» → «100»
+    выбирает по символам, а правильно — по значению (ближайшее = «250»).
+
+    Возвращает (matched, was_substituted). matched=None если ничего не нашлось.
+    Все substituted-случаи добавляются в `warnings` с правильным тегом.
+    """
+    num = _try_number(raw)
+    if num is not None and dict_strings:
+        ranged = _match_numeric_range(num, dict_strings)
+        if ranged is not None:
+            warnings.append(f"{ctx}: '{raw}' → диапазон '{ranged}' (numeric-range)")
+            return ranged, True
+        # closest-numeric — только если в словаре есть числа
+        closest = _match_closest_numeric(num, dict_strings)
+        if closest is not None:
+            warnings.append(f"{ctx}: '{raw}' → ближайшее '{closest}' (closest-numeric)")
+            return closest, True
+
+    matched, was_sub = pick_from_dict(dict_strings, raw)
+    if matched is not None and was_sub:
+        warnings.append(f"{ctx}: '{raw}' → '{matched}' (substituted)")
+    return matched, was_sub
 
 
 def map_ozon_attributes(
@@ -131,15 +189,14 @@ def map_ozon_attributes(
             vals = ozon_attr_values.get(attr_id, [])
             dict_strings = [v.get("value") for v in vals if v.get("value")]
             for r in raws:
-                matched, was_sub = pick_from_dict(dict_strings, r)
+                matched, was_sub = _resolve_value(r, dict_strings, warnings,
+                                                  ctx=f"ozon attr {name}")
                 if matched is None:
                     if required:
                         return None, warnings + [
                             f"attr {name} (#{attr_id}): '{r}' not in dict"
                         ]
                     continue
-                if was_sub:
-                    warnings.append(f"ozon attr {name}: '{r}' → '{matched}' (substituted)")
                 vid = next(
                     (v.get("id") for v in vals if v.get("value") == matched),
                     None,
@@ -220,28 +277,14 @@ def map_wb_characteristics(
             vals = wb_charc_values.get(cid, [])
             dict_strings = [v.get("name") for v in vals if v.get("name")]
             for r in raws:
-                matched, was_sub = pick_from_dict(dict_strings, r)
-                # Если pick_from_dict не нашёл — а LLM выдала число и в словаре
-                # есть диапазоны типа «до 500», «100-1000», «от 100» — пробуем
-                # числовой матч в диапазоны.
-                if matched is None:
-                    num = _try_number(r)
-                    if num is not None:
-                        ranged = _match_numeric_range(num, dict_strings)
-                        if ranged is not None:
-                            matched = ranged
-                            was_sub = True
-                            warnings.append(
-                                f"wb charc {name}: '{r}' → диапазон '{matched}' (numeric-range)"
-                            )
+                matched, _was = _resolve_value(r, dict_strings, warnings,
+                                               ctx=f"wb charc {name}")
                 if matched is None:
                     if required:
                         return None, warnings + [
                             f"charc {name} (#{cid}): '{r}' not in dict"
                         ]
                     continue
-                if was_sub and not any("numeric-range" in w for w in warnings[-1:]):
-                    warnings.append(f"wb charc {name}: '{r}' → '{matched}' (substituted)")
                 resolved.append(matched)
         elif ctype == 0:
             for r in raws:

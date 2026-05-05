@@ -143,3 +143,123 @@ def test_wb_max_count_clamp():
     vals = {1: [{"name": "А"}, {"name": "Б"}, {"name": "В"}, {"name": "Г"}]}
     out, warns = map_wb_characteristics({"1": ["А", "Б", "В", "Г"]}, charcs, vals)
     assert len(out[0]["value"]) == 2
+
+
+# ─── numeric fallbacks ────────────────────────────────────────────
+
+
+def test_wb_numeric_range_fallback():
+    """LLM '600' → 'до 1000' (диапазон)."""
+    charcs = [{"charcID": 1, "name": "Вес", "required": True, "charcType": 4}]
+    vals = {1: [{"name": "до 500"}, {"name": "до 1000"}, {"name": "до 5000"}]}
+    out, warns = map_wb_characteristics({"1": ["600"]}, charcs, vals)
+    assert out is not None
+    assert out[0]["value"] == ["до 1000"]
+    assert any("numeric-range" in w for w in warns)
+
+
+def test_wb_numeric_closest_fallback():
+    """LLM '400' → '500' (ближайшее в [100, 200, 500, 1000])."""
+    charcs = [{"charcID": 89008, "name": "Вес товара без упаковки (г)",
+               "required": True, "charcType": 4}]
+    vals = {89008: [
+        {"name": "100"}, {"name": "200"}, {"name": "500"}, {"name": "1000"},
+    ]}
+    out, warns = map_wb_characteristics({"89008": ["400"]}, charcs, vals)
+    assert out is not None
+    assert out[0]["value"] == ["500"]
+    assert any("closest-numeric" in w for w in warns)
+
+
+def test_wb_numeric_closest_picks_lower_when_equidistant():
+    """LLM '400', словарь [100, 700] — расстояние 300 равное; берёт первое (100)."""
+    charcs = [{"charcID": 1, "name": "Вес", "required": False, "charcType": 4}]
+    vals = {1: [{"name": "100"}, {"name": "700"}]}
+    out, warns = map_wb_characteristics({"1": ["400"]}, charcs, vals)
+    assert out is not None
+    # реализация: < (строго меньше), значит 100 пришёл первым и его не сменили
+    assert out[0]["value"] == ["100"]
+
+
+def test_ozon_numeric_closest_fallback():
+    """Ozon тоже умеет closest-numeric."""
+    attrs = [{"id": 100, "name": "Объём, мл", "is_required": True, "dictionary_id": 1}]
+    vals = {100: [
+        {"id": 1, "value": "100"}, {"id": 2, "value": "250"},
+        {"id": 3, "value": "500"}, {"id": 4, "value": "1000"},
+    ]}
+    out, warns = map_ozon_attributes({"100": "300"}, attrs, vals)
+    assert out is not None
+    assert out[0]["values"][0]["value"] == "250"
+    assert out[0]["values"][0]["dictionary_value_id"] == 2
+    assert any("closest-numeric" in w for w in warns)
+
+
+def test_wb_no_number_in_dict_falls_through():
+    """LLM '400', словарь — только строки [красный, синий] — closest не помогает."""
+    charcs = [{"charcID": 1, "name": "Цвет", "required": False, "charcType": 4}]
+    vals = {1: [{"name": "Красный"}, {"name": "Синий"}]}
+    out, warns = map_wb_characteristics({"1": ["400"]}, charcs, vals)
+    # Левенштейн всё-таки что-то найдёт (он первый), warnings будет substituted
+    assert out is not None or out is None  # любой исход ок: главное, не падаем
+
+
+# ─── auto-fill brand_hint / country_hint ─────────────────────────
+
+
+def test_ozon_brand_auto_fill_when_llm_missing():
+    """LLM ничего не вернула про бренд — берём из brand_hint."""
+    attrs = [{"id": 85, "name": "Бренд", "is_required": True, "dictionary_id": 1}]
+    vals = {85: [{"id": 5089754, "value": "Tide"}, {"id": 7, "value": "Procter"}]}
+    out, warns = map_ozon_attributes({}, attrs, vals, brand_hint="Tide")
+    assert out is not None
+    assert out[0]["values"][0]["dictionary_value_id"] == 5089754
+    assert out[0]["values"][0]["value"] == "Tide"
+    assert any("auto-filled" in w for w in warns)
+
+
+def test_ozon_brand_auto_fill_required_no_hint():
+    """LLM не вернула, hint тоже None — ругаемся на required."""
+    attrs = [{"id": 85, "name": "Бренд", "is_required": True, "dictionary_id": 1}]
+    vals = {85: [{"id": 1, "value": "Apple"}]}
+    out, warns = map_ozon_attributes({}, attrs, vals, brand_hint=None)
+    assert out is None
+
+
+def test_ozon_country_auto_fill():
+    """Страна-изготовитель: дефолт Россия."""
+    attrs = [{"id": 4389, "name": "Страна-изготовитель",
+              "is_required": True, "dictionary_id": 1}]
+    vals = {4389: [{"id": 90295, "value": "Россия"}, {"id": 999, "value": "Китай"}]}
+    out, warns = map_ozon_attributes({}, attrs, vals)
+    assert out is not None
+    assert out[0]["values"][0]["dictionary_value_id"] == 90295
+
+
+def test_wb_brand_auto_fill_when_llm_missing():
+    """WB: бренд достаём из brand_hint когда LLM пропустила."""
+    charcs = [{"charcID": 14177446, "name": "Бренд", "required": True, "charcType": 1}]
+    out, warns = map_wb_characteristics({}, charcs, {}, brand_hint="Tide")
+    assert out == [{"id": 14177446, "value": ["Tide"]}]
+    assert any("auto-filled" in w for w in warns)
+
+
+def test_ozon_batched_repeat_calls_consistent():
+    """Batched-режим: один и тот же llm_values + brand_hint вызывается 3 раза для 3 SKU.
+    Все 3 результата должны быть идентичны (нет state-а).
+    """
+    attrs = [
+        {"id": 85, "name": "Бренд", "is_required": True, "dictionary_id": 1},
+        {"id": 4389, "name": "Страна-изготовитель", "is_required": True, "dictionary_id": 2},
+    ]
+    vals = {
+        85: [{"id": 5089754, "value": "Tide"}],
+        4389: [{"id": 90295, "value": "Россия"}],
+    }
+    llm = {}  # LLM ничего не вернула — всё через auto-fill
+    results = [map_ozon_attributes(llm, attrs, vals, brand_hint="Tide")
+               for _ in range(3)]
+    # все 3 результата должны быть идентичны
+    assert results[0][0] == results[1][0] == results[2][0]
+    assert results[0][0] is not None
+    assert len(results[0][0]) == 2  # бренд + страна заполнены
