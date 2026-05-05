@@ -201,3 +201,86 @@ async def fill_card(
         error="Полная заливка через гнома пока не реализована. "
               "Используй DRY_RUN=true и/или старый кнопочный сценарий.",
     )
+
+
+# ─── /internal/parse_template ──────────────────────────────────────
+
+
+class ParseTemplateIn(BaseModel):
+    xlsx_path: str                      # абсолютный путь к xlsx-файлу на сервере
+    cabinet: str | None = None          # имя кабинета или "default"
+    save_as: str | None = None          # имя для сохранения (без расширения)
+
+
+class ParseTemplateOut(BaseModel):
+    ok: bool
+    saved_to: str | None = None
+    marketplace: str | None = None
+    sheet_name: str | None = None
+    n_fields: int = 0
+    n_required: int = 0
+    n_with_dropdown: int = 0
+    category_id: int | None = None
+    type_id: int | None = None
+    parse_warnings: list[str] = []
+    error: str | None = None
+
+
+@router.post("/parse_template", response_model=ParseTemplateOut)
+async def parse_template_endpoint(
+    req: ParseTemplateIn,
+    request: Request,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+):
+    """Парсит xlsx-шаблон Ozon/WB через app.excel.parser, сохраняет JSON-структуру
+    в ~/cz-backend/templates/<cabinet>/<marketplace>_<save_as>.json.
+
+    Используется скиллом гнома `parse_template` как первый шаг Excel-флоу.
+    """
+    _check_token(x_internal_token)
+    import dataclasses
+    import json
+    from pathlib import Path
+
+    from .excel.parser import parse_template as _parse
+
+    p = Path(req.xlsx_path).expanduser()
+    if not p.exists():
+        return ParseTemplateOut(ok=False, error=f"файл не найден: {req.xlsx_path}")
+    if p.suffix.lower() != ".xlsx":
+        return ParseTemplateOut(ok=False, error=f"не xlsx: {p.suffix}")
+
+    try:
+        spec = _parse(p)
+    except Exception as e:
+        logger.exception("parse_template fail %s", req.xlsx_path)
+        return ParseTemplateOut(ok=False, error=f"парсинг упал: {str(e)[:300]}")
+
+    cabinet = (req.cabinet or "default").strip() or "default"
+    save_name = (req.save_as or p.stem).strip() or p.stem
+    out_dir = Path.home() / "cz-backend" / "templates" / cabinet
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{spec.marketplace}_{save_name}.json"
+
+    try:
+        out_path.write_text(
+            json.dumps(dataclasses.asdict(spec), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        return ParseTemplateOut(ok=False, error=f"сохранение упало: {str(e)[:200]}")
+
+    n_required = sum(1 for f in spec.fields if f.required)
+    n_with_dd = sum(1 for f in spec.fields if f.dropdown)
+    return ParseTemplateOut(
+        ok=True,
+        saved_to=str(out_path),
+        marketplace=spec.marketplace,
+        sheet_name=spec.sheet_name,
+        n_fields=len(spec.fields),
+        n_required=n_required,
+        n_with_dropdown=n_with_dd,
+        category_id=spec.category_id,
+        type_id=spec.type_id,
+        parse_warnings=spec.parse_warnings or [],
+    )
