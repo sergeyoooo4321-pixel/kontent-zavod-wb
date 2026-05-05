@@ -1,15 +1,14 @@
 name: run_full_batch
 description: |
-  Запустить полный пайплайн партии (до 10 товаров): генерация 4 фото на товар →
-  подбор категории → справочники → заполнение по правилам ТЗ §5.2 → автозаливка
-  на Ozon и Wildberries → отчёт. Прогресс по этапам приходит юзеру в чат от
+  Запустить полный пайплайн партии (до 10 товаров): генерация 4 фото на товар,
+  подбор категории, справочники, заполнение по правилам ТЗ, автозаливка на
+  Ozon и Wildberries, отчёт. Прогресс по этапам приходит юзеру в чат от
   самого пайплайна — гному ждать не надо. Скилл возвращает batch_id и сразу
   отдаёт управление.
 
-  Используй когда юзер дал тебе все фото и названия и сказал «поехали» (или
-  по смыслу — собрал партию). Перед вызовом обязательно перепроверь что у
-  каждого товара есть src_url (фото уже в S3) и sku+name+brand.
-version: 0.2.0
+  Используй когда юзер дал тебе все фото и названия и сказал «поехали».
+  Перед вызовом перепроверь что у каждого товара есть src_url, sku, name, brand.
+version: 0.3.0
 input_schema:
   type: object
   properties:
@@ -18,27 +17,33 @@ input_schema:
       description: Telegram chat_id юзера — туда пайплайн будет слать прогресс
     products:
       type: array
-      maxItems: 10
+      description: Список товаров партии, до 10 штук
       items:
         type: object
         properties:
-          sku: { type: string, description: "Артикул, например 59031" }
-          name: { type: string, description: "Полное название товара" }
-          brand: { type: string, description: "Бренд, например Tide" }
+          sku:
+            type: string
+            description: Артикул товара
+          name:
+            type: string
+            description: Полное название товара
+          brand:
+            type: string
+            description: Бренд товара
           src_url:
             type: string
-            description: "Публичный URL исходного фото в S3 (bridge юзера загрузил его при отправке фото в чат)"
-          weight_g: { type: integer, description: "Вес одной единицы в граммах (опционально)" }
-          dims:
-            type: object
-            description: "Габариты {l,w,h} в см (опционально)"
-        required: [sku, name, src_url]
+            description: Публичный URL исходного фото в S3
+        required:
+          - sku
+          - name
+          - src_url
     cabinet_names:
       type: array
-      description: |
-        Имена кабинетов из настроек (например ["profit"]). Если null — берётся
-        default-кабинет из настроек. Если несколько — mirror-режим.
-      items: { type: string }
-  required: [chat_id, products]
+      description: Имена кабинетов из настроек. Пусто — будет использован default-кабинет.
+      items:
+        type: string
+  required:
+    - chat_id
+    - products
 permissions: []
 requires_approval: true
