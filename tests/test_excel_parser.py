@@ -82,6 +82,26 @@ def test_parse_wb_readonly_fallback():
     assert any("read_only" in w for w in spec.parse_warnings)
 
 
+def test_parse_wb_charc_metadata():
+    """WB-парсер вытаскивает charcID/charcType из defined_names."""
+    spec = parse_template(FIXTURES / "sample_wb.xlsx")
+    # Должны быть и атрибуты товара и служебные поля
+    charcs = [f for f in spec.fields if f.wb_charc_id]
+    statics = [f for f in spec.fields if f.wb_static]
+    assert len(charcs) >= 20, f"too few charcs: {len(charcs)}"
+    assert len(statics) >= 5, f"too few statics: {len(statics)}"
+    # Бренд должен иметь charc_id 14177446 (постоянный WB id)
+    brand = next((f for f in spec.fields if f.name == "Бренд"), None)
+    assert brand is not None
+    assert brand.wb_charc_id == 14177446
+    # «Вес товара без упаковки (г)» — charcType=4 (dictionary_single) через WB API
+    weight = next((f for f in spec.fields
+                   if "вес товара без упаковки" in f.name.lower()), None)
+    assert weight is not None
+    assert weight.wb_charc_type == 4
+    assert weight.wb_charc_id == 89008
+
+
 # ─── detect_format ───────────────────────────────────────────────
 
 

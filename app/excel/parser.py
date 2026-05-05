@@ -41,6 +41,11 @@ class TemplateField:
     required: bool = False
     description: str = ""
     dropdown: list[str] | None = None  # None если поле свободного ввода
+    # WB-специфика: charcID и charcType из defined_names (characteristic_<id>_<type>)
+    # charcType: 0=number, 1=string, 4=dictionary_single, 5=dictionary_multi
+    wb_charc_id: int | None = None
+    wb_charc_type: int | None = None
+    wb_static: bool = False     # true для static_* полей (служебные WB-колонки)
 
 
 @dataclass
@@ -267,6 +272,58 @@ def _ozon_category_ids_from_configs(wb: Workbook, warnings: list[str]) -> tuple[
 # ─── WB parser ──────────────────────────────────────────────────
 
 
+_WB_CHARC_NAME_RE = re.compile(r"^characteristic_(\d+)_(\d+)$")
+_WB_STATIC_NAME_RE = re.compile(r"^static_(\w+)_(\d+)$")
+
+
+def _wb_defined_names_by_column(wb: Workbook, sheet_name: str) -> dict[int, dict]:
+    """Парсит defined_names типа `characteristic_<id>_<type>` и `static_*_<type>`,
+    возвращает {column_index: {charc_id, charc_type, static_name?}}.
+
+    WB-шаблоны хранят charcID и charcType (0/1/4/5) через named ranges,
+    указывающие на ячейку Товары!$F$3 (имя поля). Это единственный способ
+    узнать тип поля — DataValidation в WB-xlsx нет.
+    """
+    out: dict[int, dict] = {}
+    try:
+        for dn_name in wb.defined_names:
+            try:
+                dn = wb.defined_names[dn_name]
+                val = (dn.value or "") if dn else ""
+            except Exception:
+                continue
+            if not val or "!" not in val:
+                continue
+            sn, rng = val.split("!", 1)
+            sn = sn.strip("'\"")
+            if sn != sheet_name:
+                continue
+            m = re.match(r"\$?([A-Z]+)\$?(\d+)", rng)
+            if not m:
+                continue
+            col = _col_letter_to_index(m.group(1))
+
+            mc = _WB_CHARC_NAME_RE.match(dn_name)
+            if mc:
+                out[col] = {
+                    "charc_id": int(mc.group(1)),
+                    "charc_type": int(mc.group(2)),
+                    "static": False,
+                }
+                continue
+            ms = _WB_STATIC_NAME_RE.match(dn_name)
+            if ms:
+                out[col] = {
+                    "charc_id": None,
+                    "charc_type": int(ms.group(2)),
+                    "static": True,
+                    "static_name": ms.group(1),
+                }
+    except Exception as e:
+        logger.warning("wb defined_names parse failed: %s", e)
+    return out
+
+
 def _parse_wb(wb: Workbook, used_readonly: bool, warnings: list[str]) -> TemplateSpec:
     sheet_name = "Товары" if "Товары" in wb.sheetnames else wb.sheetnames[0]
     ws = wb[sheet_name]
@@ -282,18 +339,18 @@ def _parse_wb(wb: Workbook, used_readonly: bool, warnings: list[str]) -> Templat
     }
 
     dropdowns_by_col = _wb_dropdowns_by_column(ws, used_readonly, warnings)
+    charcs_by_col = _wb_defined_names_by_column(wb, sheet_name) if not used_readonly else {}
+    if not charcs_by_col and not used_readonly:
+        warnings.append("wb: defined_names с charcID не найдены")
 
     fields: list[TemplateField] = []
     max_col = ws.max_column or 1
-    # WB-шаблон может быть очень широкий (3600+ столбцов). Идём только пока
-    # есть имя поля — пустые столбцы пропускаем, но не ломаемся на них.
     seen_cols = 0
     empty_streak = 0
     for col in range(1, max_col + 1):
         name = _cell_str(ws, header_row, col)
         if not name:
             empty_streak += 1
-            # не выходим — у WB бывают пустые столбцы между группами
             if empty_streak > 200:
                 break
             continue
@@ -306,12 +363,16 @@ def _parse_wb(wb: Workbook, used_readonly: bool, warnings: list[str]) -> Templat
             or name.endswith("*")
         )
         clean_name = name.rstrip("*").strip()
+        meta = charcs_by_col.get(col, {})
         fields.append(TemplateField(
             name=clean_name,
             column=col,
             required=required,
             description=hint,
             dropdown=dropdowns_by_col.get(col),
+            wb_charc_id=meta.get("charc_id"),
+            wb_charc_type=meta.get("charc_type"),
+            wb_static=bool(meta.get("static")),
         ))
 
     return TemplateSpec(

@@ -660,6 +660,103 @@ async def fill_excel_batch_endpoint(
     )
 
 
+# ─── /internal/load_wb_dropdowns ───────────────────────────────────
+
+
+class LoadWbDropdownsIn(BaseModel):
+    template_json_path: str             # путь к JSON от parse_template
+    cabinet: str | None = None          # имя кабинета (если есть несколько WB)
+
+
+class LoadWbDropdownsOut(BaseModel):
+    ok: bool
+    fields_updated: int = 0
+    fields_with_values: int = 0
+    error: str | None = None
+
+
+@router.post("/load_wb_dropdowns", response_model=LoadWbDropdownsOut)
+async def load_wb_dropdowns_endpoint(
+    req: LoadWbDropdownsIn,
+    request: Request,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+):
+    """Подтягивает значения dropdown'ов для WB-полей с charcType=4/5.
+
+    WB-шаблон в xlsx не содержит сами значения (в отличие от Ozon — там они
+    на листе validation). Только charcID и charcType через defined_names.
+    Этот endpoint идёт по полям где wb_charc_type in (4,5), дёргает
+    WBClient.subject_charcs/directory_values, складывает в TemplateField.dropdown
+    и перезаписывает JSON.
+    """
+    _check_token(x_internal_token)
+    import dataclasses
+    import json
+    from pathlib import Path
+
+    from .excel.parser import TemplateField, TemplateSpec
+    from .wb import WBError
+
+    json_p = Path(req.template_json_path).expanduser()
+    if not json_p.exists():
+        return LoadWbDropdownsOut(ok=False, error=f"json не найден: {json_p}")
+
+    try:
+        spec_dict = json.loads(json_p.read_text(encoding="utf-8"))
+        fields = [TemplateField(**f) for f in spec_dict.get("fields") or []]
+        spec_dict["fields"] = fields
+        spec = TemplateSpec(**spec_dict)
+    except Exception as e:
+        return LoadWbDropdownsOut(ok=False, error=f"json parse failed: {str(e)[:200]}")
+
+    if spec.marketplace != "wb":
+        return LoadWbDropdownsOut(ok=False, error=f"не WB-шаблон: {spec.marketplace}")
+
+    deps: Deps = request.app.state.deps
+    if deps.wb is None:
+        return LoadWbDropdownsOut(ok=False, error="WBClient не инициализирован (нет WB_TOKEN?)")
+
+    # Идём по dictionary-полям (charcType 4/5). Дёргаем directory_values
+    # для каждого charcID — у некоторых WB-эндпоинтов директория именная,
+    # тут используем charcID как имя (WB API принимает {name} в URL).
+    n_updated = 0
+    n_with_values = 0
+    for f in fields:
+        if f.wb_charc_type not in (4, 5):
+            continue
+        if not f.wb_charc_id:
+            continue
+        try:
+            vals = await deps.wb.directory_values(str(f.wb_charc_id))
+        except WBError as e:
+            logger.warning("wb directory %s failed: %s", f.wb_charc_id, e)
+            continue
+        except Exception as e:
+            logger.warning("wb directory %s exception: %s", f.wb_charc_id, e)
+            continue
+        names = [v.get("name") for v in vals if v.get("name")]
+        if names:
+            f.dropdown = names
+            n_with_values += 1
+        n_updated += 1
+
+    # Перезаписываем JSON с обновлёнными dropdown'ами
+    try:
+        spec.fields = fields  # type: ignore[assignment]
+        json_p.write_text(
+            json.dumps(dataclasses.asdict(spec), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        return LoadWbDropdownsOut(ok=False, error=f"json save failed: {str(e)[:200]}")
+
+    return LoadWbDropdownsOut(
+        ok=True,
+        fields_updated=n_updated,
+        fields_with_values=n_with_values,
+    )
+
+
 # ─── /internal/deliver_excel ───────────────────────────────────────
 
 
