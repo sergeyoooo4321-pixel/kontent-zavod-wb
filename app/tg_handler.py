@@ -393,6 +393,19 @@ async def handle_update(update: dict, deps) -> None:
             kb = _kb_gnome() if s.phase == "gnome_chat" else _kb_main(s)
             await _send_gnome_reply(deps, chat_id, reply, approval, kb)
             return
+        # pipeline:phase1:yes / pipeline:phase1:no — approval после Этапа 1
+        if cq_data.startswith("pipeline:phase1:") and chat_id:
+            try:
+                await deps.tg.answer_callback_query(cq.get("id") or "")
+            except Exception:
+                pass
+            accepted = cq_data.endswith(":yes")
+            from . import pipeline as _pipe
+            # Запускаем resume в фоне — callback_query handler не должен висеть.
+            asyncio.create_task(
+                _pipe.resume_after_phase1_approval(chat_id, accepted, deps)
+            )
+            return
         await _handle_legacy_callback(cq, deps)
         return
     msg = update.get("message")

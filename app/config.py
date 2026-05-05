@@ -118,6 +118,11 @@ class Settings(BaseSettings):
     OZON_API_KEY: str | None = None
     WB_TOKEN: str | None = None
 
+    # APPROVAL_AFTER_PHASE1: пауза между этапом 1 (фото) и этапами 2-4 (категории/
+    # заполнение/заливка) с inline-кнопками «✅ Принять / 🔄 Перегенерить».
+    # Опционально по §3.4 ТЗ. По умолчанию False (старое поведение — без паузы).
+    APPROVAL_AFTER_PHASE1: bool = False
+
     # DRY_RUN: при True upload_ozon / upload_wb НЕ делают реальные POST в API
     # маркетплейсов — собирают payload, шлют его в TG как JSON-документ.
     # Можно переключать прямо из бота в runtime через кнопку «Настройки».

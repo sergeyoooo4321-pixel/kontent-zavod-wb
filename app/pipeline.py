@@ -501,6 +501,65 @@ class CategoryData:
     wb_charc_values: dict[int, list[dict]]   # charcID → values list
 
 
+async def download_ozon_templates_for_unique_cats(
+    unique_cats: set[tuple[int, int | None, int]],
+    batch_id: str,
+    deps: Deps,
+) -> dict[tuple[int, int | None], str]:
+    """По каждой уникальной паре (ozon_id, type_id) скачивает xlsx-шаблон Ozon
+    и сохраняет в ~/cz-backend/templates_downloaded/<batch_id>/<ozon_id>_<type_id>.xlsx.
+
+    Возвращает {(ozon_id, type_id): абсолютный_путь} только для успешно скачанных.
+    Per-category ошибка → warning в лог, не валит партию.
+
+    §4 ТЗ требует скачать «пустой Excel-шаблон из кабинета». В основном пайплайне
+    мы используем эквивалент через category_attributes/values API, но xlsx-файл
+    тоже сохраняем — для compliance и чтобы потом можно было дать юзеру скачать
+    либо использовать в Excel-флоу через гнома без TG-загрузки.
+    """
+    from pathlib import Path
+
+    out: dict[tuple[int, int | None], str] = {}
+    if deps.ozon is None:
+        return out
+
+    out_dir = Path.home() / "cz-backend" / "templates_downloaded" / batch_id
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        logger.warning("templates_downloaded mkdir failed: %s", e)
+        return out
+
+    seen: set[tuple[int, int | None]] = set()
+    for ozon_id, type_id, _wb_id in unique_cats:
+        if not ozon_id or not type_id:
+            continue
+        key = (ozon_id, type_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            data = await deps.ozon.download_template(ozon_id, type_id)
+        except OzonError as e:
+            logger.warning("download_template ozon=%s type=%s skipped: %s",
+                           ozon_id, type_id, e)
+            continue
+        except Exception as e:
+            logger.warning("download_template ozon=%s type=%s exception: %s",
+                           ozon_id, type_id, e)
+            continue
+        path = out_dir / f"{ozon_id}_{type_id}.xlsx"
+        try:
+            path.write_bytes(data)
+            out[key] = str(path)
+            logger.info("downloaded ozon template %s/%s → %s (%d bytes)",
+                        ozon_id, type_id, path, len(data))
+        except Exception as e:
+            logger.warning("write_bytes %s failed: %s", path, e)
+
+    return out
+
+
 def dedup_categories(states: list[ProductState]) -> set[tuple[int, int | None, int]]:
     """Возвращает уникальные пары (ozon_id, ozon_type_id, wb_id) для дедупа.
 
@@ -1064,8 +1123,19 @@ async def upload_wb(
 # ─── главная корутина ────────────────────────────────────────────
 
 
+# RAM-store для approval-after-phase1: chat_id → {req, states, timings}.
+# При рестарте сервиса теряется (как и весь TgSession in-memory state).
+_pending_phase1: dict[int, dict] = {}
+
+
 async def run_batch(req: RunRequest, deps: Deps) -> None:
-    """Главная точка пайплайна. Кладётся в FastAPI BackgroundTasks."""
+    """Главная точка пайплайна. Кладётся в FastAPI BackgroundTasks.
+
+    Если settings.APPROVAL_AFTER_PHASE1 — после этапа 1 (фото) выходим, кладём
+    state в _pending_phase1 и шлём юзеру inline-кнопки. Этап 2-5 продолжается
+    из tg_handler.callback_query когда юзер нажмёт «✅ Принять» (через
+    resume_after_phase1_approval).
+    """
     import time as _time
     timings: dict[str, float] = {}
     try:
@@ -1095,6 +1165,83 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
             f"📸 Фото: {ok_imgs}/{len(states)} товаров готовы (за {timings['1_photos']:.0f} сек)"
         )
 
+        # §3.4 ТЗ — опциональная точка контроля после этапа 1
+        if settings.APPROVAL_AFTER_PHASE1:
+            _pending_phase1[req.chat_id] = {
+                "req": req,
+                "states": states,
+                "timings": timings,
+            }
+            try:
+                await deps.tg.send_with_buttons(
+                    req.chat_id,
+                    f"🛑 *Контроль перед заливкой.* Партия `{req.batch_id}`: "
+                    f"{ok_imgs}/{len(states)} товаров с фото. "
+                    "Принять и продолжить, или перегенерить заново?",
+                    buttons=[[
+                        {"text": "✅ Принять", "callback_data": "pipeline:phase1:yes"},
+                        {"text": "🔄 Перегенерить", "callback_data": "pipeline:phase1:no"},
+                    ]],
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                logger.warning("send approval buttons fail: %s", e)
+                # без кнопок не получим ответ — продолжаем без approval
+                _pending_phase1.pop(req.chat_id, None)
+                await _run_phases_2_5(req, deps, states, timings)
+            return
+
+        await _run_phases_2_5(req, deps, states, timings)
+    except Exception as e:
+        logger.exception("run_batch fatal: %s", e)
+        try:
+            await deps.tg.send(req.chat_id, f"❌ Критическая ошибка: {str(e)[:500]}")
+        except Exception:
+            pass
+
+
+async def resume_after_phase1_approval(
+    chat_id: int, accepted: bool, deps: Deps,
+) -> bool:
+    """Возобновляет pipeline после approval-кнопки. Возвращает True если был
+    pending для этого chat_id (и мы что-то сделали), False если pending пуст."""
+    pending = _pending_phase1.pop(chat_id, None)
+    if not pending:
+        return False
+    if not accepted:
+        try:
+            await deps.tg.send(
+                chat_id,
+                "❌ Партия отменена. Запусти новую через «📦 Новая партия».",
+            )
+        except Exception:
+            pass
+        return True
+    try:
+        await deps.tg.send(chat_id, "✅ Принято — продолжаю этапы 2-5.")
+        await _run_phases_2_5(
+            pending["req"], deps,
+            pending["states"], pending["timings"],
+        )
+    except Exception as e:
+        logger.exception("resume_after_phase1_approval fatal: %s", e)
+        try:
+            await deps.tg.send(chat_id, f"❌ Критическая ошибка: {str(e)[:500]}")
+        except Exception:
+            pass
+    return True
+
+
+async def _run_phases_2_5(
+    req: RunRequest, deps: Deps,
+    states: list[ProductState], timings: dict[str, float],
+) -> None:
+    """Этапы 2-5 пайплайна: категории + справочники + тексты + заливка + отчёт.
+    Вызывается либо напрямую из run_batch (если APPROVAL_AFTER_PHASE1=False),
+    либо из resume_after_phase1_approval (после ✅).
+    """
+    import time as _time
+    try:
         # Какие стороны нужны исходя из target-кабинетов (а не всех настроенных)
         targets_preview: list[Cabinet] = []
         for nm in (req.cabinet_names or []):
@@ -1154,17 +1301,32 @@ async def run_batch(req: RunRequest, deps: Deps) -> None:
             pass
         t0 = _time.monotonic()
         unique_cats = dedup_categories(states)
-        cat_data: dict[tuple, CategoryData] = {}
-        for ck in unique_cats:
-            try:
-                cat_data[ck] = await load_category_data(ck[0], ck[1], ck[2], deps)
-            except Exception as e:
-                logger.exception("load_category_data %s: %s", ck, e)
+
+        # §4 ТЗ — скачиваем xlsx-шаблоны Ozon (по уникальным категориям).
+        # Параллельно с load_category_data: независимы. xlsx идёт «для буквы ТЗ»
+        # и для возможного re-use в Excel-флоу через гнома.
+        async def _load_all_cat_data() -> dict[tuple, CategoryData]:
+            out: dict[tuple, CategoryData] = {}
+            for ck in unique_cats:
+                try:
+                    out[ck] = await load_category_data(ck[0], ck[1], ck[2], deps)
+                except Exception as e:
+                    logger.exception("load_category_data %s: %s", ck, e)
+            return out
+
+        downloaded_xlsx, cat_data = await asyncio.gather(
+            download_ozon_templates_for_unique_cats(unique_cats, req.batch_id, deps),
+            _load_all_cat_data(),
+        )
         timings["3_dictionaries"] = _time.monotonic() - t0
+        if downloaded_xlsx:
+            logger.info("downloaded %d ozon xlsx templates for batch %s",
+                        len(downloaded_xlsx), req.batch_id)
         await deps.tg.send(
             req.chat_id,
-            f"📋 Загружено {len(cat_data)} категорий со справочниками "
-            f"(за {timings['3_dictionaries']:.0f} сек)"
+            f"📋 Загружено {len(cat_data)} категорий со справочниками"
+            + (f" + {len(downloaded_xlsx)} xlsx" if downloaded_xlsx else "")
+            + f" (за {timings['3_dictionaries']:.0f} сек)"
         )
 
         # Этап 4: тексты + расширение SKU
