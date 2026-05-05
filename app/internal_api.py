@@ -939,9 +939,9 @@ async def run_full_batch_endpoint(
         for i, p in enumerate(req.products)
     ]
     batch_id = f"gnome-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    cabinet_names = req.cabinet_names or (
-        [settings.default_cabinet_name] if settings.default_cabinet_name else None
-    )
+    # Если LLM не передал cabinet_names — оставляем None, pipeline сам
+    # разрешит default через settings.default_cabinet_name внутри run_batch.
+    cabinet_names = req.cabinet_names or None
     rr = RunRequest(
         batch_id=batch_id,
         chat_id=req.chat_id,
