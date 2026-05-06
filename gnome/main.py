@@ -40,7 +40,10 @@ class ChatOut(BaseModel):
 async def lifespan(app: FastAPI):
     timeout = httpx.Timeout(180.0, connect=10.0)
     http = httpx.AsyncClient(timeout=timeout)
-    llm = KieLLM(base=settings.KIE_BASE, api_key=settings.KIE_API_KEY, http=http)
+    # aitunnel.ru: один endpoint, ключ начинается на sk-aitunnel-
+    base = settings.AITUNNEL_BASE or settings.KIE_BASE
+    api_key = settings.AITUNNEL_API_KEY or settings.KIE_API_KEY
+    llm = KieLLM(base=base, api_key=api_key, http=http)
     registry = ToolRegistry(skills_dir=settings.skills_dir)
     sessions = SessionStore(db_path=settings.data_dir / "sessions.db")
     engine = QueryEngine(settings=settings, llm=llm, registry=registry, sessions=sessions)

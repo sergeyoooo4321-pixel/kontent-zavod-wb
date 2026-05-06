@@ -42,16 +42,20 @@ async def lifespan(app: FastAPI):
     http = httpx.AsyncClient(timeout=timeout, follow_redirects=True)
 
     tg = TelegramClient(settings.TG_BOT_TOKEN, http, settings.TG_API_BASE)
+    # AI-провайдер: aitunnel.ru (имя класса историческое — раньше был kie.ai).
+    # Если AITUNNEL_API_KEY не задан — фолбэк на старый KIE_API_KEY (миграционно).
+    ai_key = settings.AITUNNEL_API_KEY or settings.KIE_API_KEY
     kie = KieAIClient(
-        base_url=settings.KIE_BASE,
-        api_key=settings.KIE_API_KEY,
+        base_url=settings.AITUNNEL_BASE,
+        api_key=ai_key,
         http=http,
-        image_model=settings.KIE_IMAGE_MODEL,
-        llm_model=settings.KIE_LLM_MODEL,
-        poll_interval=settings.KIE_POLL_INTERVAL_SEC,
-        poll_max_attempts=settings.KIE_POLL_MAX_ATTEMPTS,
-        max_concurrent=settings.KIE_MAX_CONCURRENT,
-        rate_per_sec=settings.KIE_RATE_PER_SEC,
+        image_model=settings.AITUNNEL_IMAGE_MODEL,
+        llm_model=settings.AITUNNEL_LLM_MODEL,
+        llm_fallback_model=settings.AITUNNEL_LLM_FALLBACK_MODEL,
+        poll_interval=settings.AITUNNEL_POLL_INTERVAL_SEC,
+        poll_max_attempts=settings.AITUNNEL_POLL_MAX_ATTEMPTS,
+        max_concurrent=settings.AITUNNEL_MAX_CONCURRENT,
+        rate_per_sec=settings.AITUNNEL_RATE_PER_SEC,
     )
     s3 = S3Client(
         endpoint=settings.S3_ENDPOINT,

@@ -1,7 +1,8 @@
-"""KieLLM — минимальный async-клиент к kie.ai (OpenAI-совместимый).
+"""KieLLM — async-клиент к aitunnel.ru (OpenAI-совместимый).
 
-Endpoint: {KIE_BASE}/{model}/v1/chat/completions
-Поддерживает: tools (function calling), vision (image_url), 429-retry, biz-error retry.
+Имя класса историческое — раньше был kie.ai. Endpoint:
+  {AITUNNEL_BASE}/chat/completions   (модель в body, не в URL)
+Поддерживает: tools (function calling), vision (image_url), 429-retry, 5xx-retry.
 """
 from __future__ import annotations
 
@@ -73,7 +74,8 @@ class KieLLM:
         messages — без system; system передаётся отдельно и автоматически
         добавляется первым элементом.
         """
-        url = f"{self._base}/{model}/v1/chat/completions"
+        # aitunnel: единый endpoint /chat/completions, модель — в теле
+        url = f"{self._base}/chat/completions"
         body: dict[str, Any] = {
             "model": model,
             "messages": ([{"role": "system", "content": system}] if system else []) + messages,

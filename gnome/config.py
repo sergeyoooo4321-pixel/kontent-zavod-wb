@@ -13,10 +13,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # AI-провайдер: aitunnel.ru
+    AITUNNEL_API_KEY: str = ""
+    AITUNNEL_BASE: str = "https://api.aitunnel.ru/v1"
+    # Backward-compat: если AITUNNEL_API_KEY пустой — берём KIE_API_KEY
     KIE_API_KEY: str = ""
-    KIE_BASE: str = "https://api.kie.ai"
-    LLM_MODEL: str = "gemini-3-pro"
-    LLM_FALLBACK_MODEL: str = "gpt-5-2"
+    KIE_BASE: str = "https://api.aitunnel.ru/v1"
+    LLM_MODEL: str = "gemini-3-1-pro-preview"
+    LLM_FALLBACK_MODEL: str = "claude-sonnet-4-6"
 
     AGENT_PORT: int = 8001
     AGENT_HOST: str = "127.0.0.1"
