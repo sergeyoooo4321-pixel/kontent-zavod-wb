@@ -76,8 +76,8 @@ class Settings(BaseSettings):
     AITUNNEL_BASE: str = "https://api.aitunnel.ru/v1"
     AITUNNEL_API_KEY: str = ""
     AITUNNEL_IMAGE_MODEL: str = "gpt-image-2"
-    AITUNNEL_LLM_MODEL: str = "gemini-3-1-pro-preview"
-    AITUNNEL_LLM_FALLBACK_MODEL: str = "claude-sonnet-4-6"
+    AITUNNEL_LLM_MODEL: str = "gemini-3.1-pro-preview"
+    AITUNNEL_LLM_FALLBACK_MODEL: str = "claude-sonnet-4.6"
     AITUNNEL_POLL_INTERVAL_SEC: float = 5.0
     AITUNNEL_POLL_MAX_ATTEMPTS: int = 60
     AITUNNEL_RATE_PER_SEC: float = 2.0
@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     KIE_BASE: str = "https://api.kie.ai"
     KIE_API_KEY: str = ""
     KIE_IMAGE_MODEL: str = "gpt-image-2"
-    KIE_LLM_MODEL: str = "gemini-3-1-pro-preview"
+    KIE_LLM_MODEL: str = "gemini-3.1-pro-preview"
     KIE_POLL_INTERVAL_SEC: float = 5.0
     KIE_POLL_MAX_ATTEMPTS: int = 60
     KIE_RATE_PER_SEC: float = 2.0
