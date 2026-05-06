@@ -17,6 +17,24 @@ async def run(params: dict, ctx) -> dict:
         return {"ok": False, "error": "products пустой"}
     if len(products) > 10:
         return {"ok": False, "error": f"максимум 10 товаров, получил {len(products)}"}
+
+    # Защита от галлюцинаций src_url: гном (особенно Gemini) иногда придумывает
+    # URL фото которое юзер «вроде кидал». Используем список РЕАЛЬНО загруженных
+    # URL'ов от bridge — если src_url не оттуда, подменяем по индексу.
+    real_urls = ctx.sessions.recent_uploads(chat_id)
+    if real_urls:
+        for i, p in enumerate(products):
+            url = (p.get("src_url") or "").strip()
+            if url not in real_urls:
+                # Подмена: берём из реальных по позиции, если есть; иначе последний
+                fallback = real_urls[i] if i < len(real_urls) else real_urls[-1]
+                p["src_url"] = fallback
+    else:
+        # Совсем нет загруженных URL'ов — нечем заменить, но раз гном вызвал
+        # скилл, скорее всего юзер действительно фото присылал ранее. Пусть
+        # пайплайн попробует с тем что есть; ошибка fetch_image будет видна.
+        pass
+
     body = {
         "chat_id": int(chat_id),
         "products": products,

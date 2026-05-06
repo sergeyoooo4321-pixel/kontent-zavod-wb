@@ -70,6 +70,9 @@ class QueryEngine:
             content = [{"type": "text", "text": user_text}] if user_text else []
             for url in images:
                 content.append({"type": "image_url", "image_url": {"url": url}})
+                # запоминаем URL чтобы скиллы могли проверить что src_url
+                # реальный а не выдуманный LLM
+                self._sessions.add_uploaded_url(chat_id, url)
             sess.messages.append({"role": "user", "content": content})
         else:
             sess.messages.append({"role": "user", "content": user_text})

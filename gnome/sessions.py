@@ -30,6 +30,24 @@ class SessionStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
         self._locks: dict[int, asyncio.Lock] = {}
+        # In-memory кеш реально загруженных юзером URL фото (per chat_id).
+        # Чтобы скиллы (например run_full_batch) могли проверить что src_url
+        # не выдуман LLM, а реально приходил от bridge с фото юзера.
+        # Не хранится между рестартами — это нормально для текущей сессии.
+        self._recent_uploads: dict[int, list[str]] = {}
+
+    def add_uploaded_url(self, chat_id: int, url: str, max_keep: int = 20) -> None:
+        if not url:
+            return
+        lst = self._recent_uploads.setdefault(chat_id, [])
+        if url in lst:
+            return
+        lst.append(url)
+        if len(lst) > max_keep:
+            del lst[: len(lst) - max_keep]
+
+    def recent_uploads(self, chat_id: int) -> list[str]:
+        return list(self._recent_uploads.get(chat_id, []))
 
     def _conn(self) -> sqlite3.Connection:
         c = sqlite3.connect(str(self._path), isolation_level=None, timeout=10.0)

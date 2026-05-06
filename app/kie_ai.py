@@ -149,6 +149,15 @@ class KieAIClient:
 
     # ─── Image generation (aitunnel /v1/images/generations) ─────────
 
+    async def _fetch_image_bytes(self, url: str) -> tuple[bytes, str]:
+        """Скачать картинку по URL → (bytes, mime). Используется как источник
+        для /v1/images/edits."""
+        r = await self._http.get(url, timeout=60.0, follow_redirects=True)
+        if r.status_code >= 400:
+            raise KieAIError(f"fetch src_url {url} → HTTP {r.status_code}")
+        mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+        return r.content, mime
+
     async def generate_image_with_retry(
         self,
         *,
@@ -162,11 +171,19 @@ class KieAIClient:
         seed: int | None = None,
         max_retries: int = 4,
     ) -> str:
-        """Сгенерировать одну картинку через aitunnel /v1/images/generations.
+        """Сгенерировать одну картинку через aitunnel.
 
-        gpt-image-2 поддерживает image-to-image через параметр `image: [url]`.
-        size мапится из aspect_ratio: "3:4" → "1024x1536", "2:3"/"9:16" → "1024x1536",
-        "1:1" → "1024x1024", "16:9"/"3:2" → "1536x1024".
+        Если есть `input_urls` (image-to-image сценарий) — идём в
+        `/v1/images/edits` через multipart/form-data: качаем первое URL
+        как bytes, отдаём как файл `image`. Aitunnel-OpenAI strict
+        compliance: JSON `image: [url]` НЕ поддерживается, нужен только
+        multipart на edits endpoint.
+
+        Если `input_urls` пустой — обычный text-to-image через
+        `/v1/images/generations` JSON.
+
+        size мапится из aspect_ratio: 3:4/2:3/9:16 → 1024x1536,
+        1:1 → 1024x1024, 16:9/3:2 → 1536x1024.
         """
         size_map = {
             "3:4": "1024x1536",
@@ -177,27 +194,65 @@ class KieAIClient:
             "3:2": "1536x1024",
         }
         size = size_map.get(aspect_ratio, "1024x1536")
-        body: dict[str, Any] = {
-            "model": model or self._image_model,
-            "prompt": prompt,
-            "size": size,
-            "n": 1,
-            "quality": "high",
-        }
-        if input_urls:
-            clean = [u for u in input_urls if u]
-            if clean:
-                body["image"] = clean
-        if seed is not None:
-            body["seed"] = seed
+        m = model or self._image_model
 
-        url = f"{self._base}/images/generations"
+        clean_urls = [u for u in (input_urls or []) if u]
+        is_edit = bool(clean_urls)
+
+        # Готовим payload в зависимости от режима
+        endpoint: str
+        json_body: dict[str, Any] | None = None
+        files_data: dict[str, Any] | None = None
+        form_data: dict[str, str] | None = None
+
+        if is_edit:
+            try:
+                img_bytes, img_mime = await self._fetch_image_bytes(clean_urls[0])
+            except KieAIError as e:
+                raise
+            ext = "jpg" if "jpeg" in img_mime else ("png" if "png" in img_mime else "jpg")
+            endpoint = f"{self._base}/images/edits"
+            files_data = {"image": (f"source.{ext}", img_bytes, img_mime)}
+            form_data = {
+                "model": m,
+                "prompt": prompt,
+                "size": size,
+                "n": "1",
+                "quality": "high",
+            }
+        else:
+            endpoint = f"{self._base}/images/generations"
+            json_body = {
+                "model": m,
+                "prompt": prompt,
+                "size": size,
+                "n": 1,
+                "quality": "high",
+            }
+            if seed is not None:
+                json_body["seed"] = seed
+
+        # Multipart-вызов httpx требует чтобы Content-Type не передавался
+        # в headers — он формируется сам по boundary
+        auth_only = {"Authorization": self._headers["Authorization"]}
+
         last_err: Exception | None = None
         for attempt in range(max_retries + 1):
             await self._throttle()
             try:
                 async with self._sem:
-                    r = await self._request_with_429("POST", url, json=body, timeout=300.0)
+                    if is_edit:
+                        r = await self._http.post(
+                            endpoint,
+                            headers=auth_only,
+                            files=files_data,
+                            data=form_data,
+                            timeout=300.0,
+                        )
+                    else:
+                        r = await self._request_with_429(
+                            "POST", endpoint, json=json_body, timeout=300.0,
+                        )
             except httpx.HTTPError as e:
                 last_err = e
                 logger.warning("aitunnel image net err attempt %d/%d: %s",
@@ -211,18 +266,16 @@ class KieAIClient:
                 last_err = KieAIError(f"HTTP {r.status_code}: {err_body}")
                 logger.warning("aitunnel image HTTP %s attempt %d/%d: %s",
                                r.status_code, attempt + 1, max_retries + 1, err_body)
-                # 5xx и transient — retry
                 if r.status_code >= 500 and attempt < max_retries:
                     await asyncio.sleep(min(2 ** attempt + random.uniform(0, 2), 30))
                     continue
-                # 4xx (кроме 429 уже обработан) — не retry
                 if r.status_code < 500:
                     raise last_err
                 continue
 
             try:
                 data = r.json()
-            except Exception as e:
+            except Exception:
                 last_err = KieAIError(f"non-JSON image response: {r.text[:200]}")
                 continue
             items = data.get("data") or []
@@ -236,9 +289,8 @@ class KieAIClient:
             if not url_or_b64:
                 last_err = KieAIError(f"image: no url/b64 in {str(items[0])[:200]}")
                 continue
-            # aitunnel может вернуть data:image/...;base64,... — это уже URL
-            logger.info("aitunnel image ok model=%s size=%s (%d попытка)",
-                        body["model"], size, attempt + 1)
+            logger.info("aitunnel image ok model=%s size=%s endpoint=%s (%d попытка)",
+                        m, size, "edits" if is_edit else "generations", attempt + 1)
             return url_or_b64
 
         raise KieAIError(f"generate_image failed after {max_retries + 1} attempts: {last_err}")
