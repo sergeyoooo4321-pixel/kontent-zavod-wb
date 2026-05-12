@@ -184,7 +184,10 @@ async def process_product_images(
                     prompt=prompt,
                     input_urls=[state.src_url],  # ВСЕГДА оригинал
                 )
-                content = await deps.s3.fetch(kie_url)
+                # aitunnel может вернуть data:URI или чистый base64 — тогда
+                # нельзя fetch'нуть, нужно декодировать. fetch_or_decode_image
+                # покрывает все варианты.
+                content = await deps.kie.fetch_or_decode_image(kie_url)
                 public = await deps.s3.put_public(
                     S3Client.build_key(batch_id, state.sku, tag), content
                 )

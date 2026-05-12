@@ -158,6 +158,36 @@ class KieAIClient:
         mime = r.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
         return r.content, mime
 
+    async def fetch_or_decode_image(self, url_or_data: str) -> bytes:
+        """Универсально получить bytes картинки.
+
+        Aitunnel может вернуть либо обычный https-URL, либо data:URI с base64,
+        либо чистый base64 без префикса. Метод пытается все варианты.
+        """
+        import base64
+        s = (url_or_data or "").strip()
+        if not s:
+            raise KieAIError("empty url/data")
+        if s.startswith("data:"):
+            comma = s.find(",")
+            if comma < 0:
+                raise KieAIError("malformed data URI")
+            payload = s[comma + 1:]
+            try:
+                return base64.b64decode(payload)
+            except Exception as e:
+                raise KieAIError(f"data URI b64 decode fail: {e}") from e
+        if s.startswith(("http://", "https://")):
+            r = await self._http.get(s, timeout=120.0, follow_redirects=True)
+            if r.status_code >= 400:
+                raise KieAIError(f"fetch image {s[:80]}... HTTP {r.status_code}")
+            return r.content
+        # Чистый base64 без префикса (некоторые провайдеры так делают)
+        try:
+            return base64.b64decode(s, validate=False)
+        except Exception as e:
+            raise KieAIError(f"image is neither URL nor base64: {s[:80]}... ({e})") from e
+
     async def generate_image_with_retry(
         self,
         *,
