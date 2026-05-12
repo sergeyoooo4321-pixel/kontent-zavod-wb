@@ -16,9 +16,6 @@ class Settings(BaseSettings):
     # AI-провайдер: aitunnel.ru
     AITUNNEL_API_KEY: str = ""
     AITUNNEL_BASE: str = "https://api.aitunnel.ru/v1"
-    # Backward-compat: если AITUNNEL_API_KEY пустой — берём KIE_API_KEY
-    KIE_API_KEY: str = ""
-    KIE_BASE: str = "https://api.aitunnel.ru/v1"
     LLM_MODEL: str = "gemini-3.1-pro-preview"
     LLM_FALLBACK_MODEL: str = "claude-sonnet-4.6"
 

@@ -43,11 +43,9 @@ async def lifespan(app: FastAPI):
 
     tg = TelegramClient(settings.TG_BOT_TOKEN, http, settings.TG_API_BASE)
     # AI-провайдер: aitunnel.ru (имя класса историческое — раньше был kie.ai).
-    # Если AITUNNEL_API_KEY не задан — фолбэк на старый KIE_API_KEY (миграционно).
-    ai_key = settings.AITUNNEL_API_KEY or settings.KIE_API_KEY
     kie = KieAIClient(
         base_url=settings.AITUNNEL_BASE,
-        api_key=ai_key,
+        api_key=settings.AITUNNEL_API_KEY,
         http=http,
         image_model=settings.AITUNNEL_IMAGE_MODEL,
         llm_model=settings.AITUNNEL_LLM_MODEL,

@@ -41,9 +41,7 @@ async def lifespan(app: FastAPI):
     timeout = httpx.Timeout(180.0, connect=10.0)
     http = httpx.AsyncClient(timeout=timeout)
     # aitunnel.ru: один endpoint, ключ начинается на sk-aitunnel-
-    base = settings.AITUNNEL_BASE or settings.KIE_BASE
-    api_key = settings.AITUNNEL_API_KEY or settings.KIE_API_KEY
-    llm = KieLLM(base=base, api_key=api_key, http=http)
+    llm = KieLLM(base=settings.AITUNNEL_BASE, api_key=settings.AITUNNEL_API_KEY, http=http)
     registry = ToolRegistry(skills_dir=settings.skills_dir)
     sessions = SessionStore(db_path=settings.data_dir / "sessions.db")
     engine = QueryEngine(settings=settings, llm=llm, registry=registry, sessions=sessions)
@@ -79,10 +77,10 @@ async def healthz():
 
 @app.post("/chat", response_model=ChatOut)
 async def chat(req: ChatIn):
-    if not (settings.AITUNNEL_API_KEY or settings.KIE_API_KEY):
+    if not settings.AITUNNEL_API_KEY:
         raise HTTPException(
             status_code=503,
-            detail="AITUNNEL_API_KEY (или KIE_API_KEY как fallback) не задан в .env",
+            detail="AITUNNEL_API_KEY не задан в .env",
         )
     engine: QueryEngine = app.state.engine
     reply = await engine.query(req.chat_id, req.text, images=req.images)
