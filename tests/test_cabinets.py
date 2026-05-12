@@ -3,6 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="тестировали удалённый pipeline.run_batch / upload_* / _build_wb_card")
+
 
 def _reload_settings(monkeypatch, env: dict[str, str]) -> "Settings":
     """Создаёт новый Settings instance под заданный env (без перезагрузки модуля,

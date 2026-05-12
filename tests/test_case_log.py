@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="тестировали удалённый pipeline.run_batch / upload_* / _build_wb_card")
+
 
 @pytest.fixture
 def tmp_cases_dir(tmp_path: Path, monkeypatch):

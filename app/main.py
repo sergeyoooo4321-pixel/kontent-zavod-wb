@@ -1,4 +1,4 @@
-"""FastAPI entry point. Эндпоинты /healthz и /api/run."""
+"""FastAPI entry point. Эндпоинты /healthz и /tg/webhook."""
 from __future__ import annotations
 
 import logging
@@ -6,16 +6,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, status
-
-from fastapi import Request
+from fastapi import BackgroundTasks, FastAPI, Request
 
 from .config import settings
 from .internal_api import router as internal_router
 from .kie_ai import KieAIClient
-from .models import RunRequest, RunResponse
 from .ozon import OzonClient
-from .pipeline import Deps, run_batch
+from .pipeline import Deps
 from .s3 import S3Client
 from .telegram import TelegramClient
 from .tg_handler import handle_update
@@ -123,19 +120,3 @@ async def tg_webhook(request: Request, bg: BackgroundTasks):
     return {"ok": True}
 
 
-@app.post("/api/run", response_model=RunResponse, status_code=status.HTTP_202_ACCEPTED)
-async def api_run(
-    req: RunRequest,
-    bg: BackgroundTasks,
-    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
-):
-    if settings.INTERNAL_TOKEN and x_internal_token != settings.INTERNAL_TOKEN:
-        raise HTTPException(status_code=403, detail="bad internal token")
-    deps: Deps = app.state.deps
-    bg.add_task(run_batch, req, deps)
-    logger.info("api/run queued batch=%s products=%d", req.batch_id, len(req.products))
-    return RunResponse(
-        batch_id=req.batch_id,
-        queued=True,
-        received_at=datetime.now(timezone.utc).isoformat(),
-    )

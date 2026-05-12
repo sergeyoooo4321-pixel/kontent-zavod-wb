@@ -16,15 +16,6 @@ from pydantic import BaseModel
 
 from .config import settings
 from .pipeline import Deps
-from .prompts import (
-    build_design_director_system,
-    build_design_director_user,
-    compile_image_prompt,
-    build_extra_prompt,
-    build_main_prompt,
-    build_pack_prompt,
-)
-from .s3 import S3Client
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/internal", tags=["internal"])
@@ -88,178 +79,6 @@ def _pick_ozon_client(cabinet_name: str | None, deps: "Deps"):
 
     return None, ""
 
-
-# ─── /internal/generate_image ──────────────────────────────────────
-
-
-class GenImageIn(BaseModel):
-    src_url: str  # публичный URL исходной фотки (юзер прислал, уже в S3)
-    brand: str
-    name: str
-    sku: str = ""  # опционально для tagging в S3
-    variants: list[str] = ["main", "pack2", "pack3", "extra"]
-
-
-class GenImageOut(BaseModel):
-    ok: bool
-    images: dict[str, str]  # tag → public_url
-    errors: dict[str, str]  # tag → error msg
-    brief: dict | None = None
-
-
-@router.post("/generate_image", response_model=GenImageOut)
-async def gen_image(
-    req: GenImageIn,
-    request: Request,
-    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
-):
-    _check_token(x_internal_token)
-    deps: Deps = request.app.state.deps
-    sku = req.sku or uuid.uuid4().hex[:8]
-    batch_id = f"gnome-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-
-    # 1. brief через vision LLM (как в pipeline.process_product_images)
-    brief: dict = {}
-    try:
-        brief = await deps.kie.chat_json_with_vision(
-            system=build_design_director_system(),
-            user=build_design_director_user(req.name, req.brand),
-            image_url=req.src_url,
-        )
-        logger.info("internal/gen_image brief sku=%s ok", sku)
-    except Exception as e:
-        logger.warning("internal/gen_image brief failed sku=%s: %s — generic", sku, e)
-        brief = {}
-
-    # 2. Параллельно все варианты
-    import asyncio
-    images: dict[str, str] = {}
-    errors: dict[str, str] = {}
-
-    async def _gen_one(tag: str) -> tuple[str, str | None, str | None]:
-        try:
-            # compile_image_prompt поддерживает только main / pack2 / pack3 / extra
-            qty_for_pack = 2 if tag == "pack2" else (3 if tag == "pack3" else None)
-            if tag in ("main", "extra", "pack2", "pack3"):
-                prompt_kwargs = {"mode": tag}
-                if qty_for_pack:
-                    prompt_kwargs["qty"] = qty_for_pack
-                prompt = compile_image_prompt(brief, req.name, **prompt_kwargs)
-            else:
-                # незнакомый tag — отдадим main-промпт чтобы не упасть
-                prompt = compile_image_prompt(brief, req.name, mode="main")
-            kie_url = await deps.kie.generate_image_with_retry(
-                prompt=prompt,
-                input_urls=[req.src_url],
-            )
-            # aitunnel часто возвращает data:URI / base64 вместо URL —
-            # fetch_or_decode_image универсально обработает все варианты.
-            content = await deps.kie.fetch_or_decode_image(kie_url)
-            public = await deps.s3.put_public(
-                S3Client.build_key(batch_id, sku, tag), content,
-            )
-            return tag, public, None
-        except Exception as e:
-            return tag, None, str(e)[:300]
-
-    results = await asyncio.gather(*[_gen_one(t) for t in req.variants])
-    for tag, url, err in results:
-        if url:
-            images[tag] = url
-        else:
-            errors[tag] = err or "unknown"
-
-    return GenImageOut(
-        ok=bool(images),
-        images=images,
-        errors=errors,
-        brief=brief or None,
-    )
-
-
-# ─── /internal/match_category ──────────────────────────────────────
-
-
-class MatchCategoryIn(BaseModel):
-    name: str
-    brand: str = ""
-    main_image_url: str | None = None
-    side: str = "both"  # "ozon" | "wb" | "both"
-
-
-class MatchCategoryOut(BaseModel):
-    ok: bool
-    ozon: list[dict] | None = None
-    wb: list[dict] | None = None
-    error: str | None = None
-
-
-@router.post("/match_category", response_model=MatchCategoryOut)
-async def match_category(
-    req: MatchCategoryIn,
-    request: Request,
-    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
-):
-    """Stub: полный match_category — внутри make_batch_zip; этот endpoint
-    deprecated.
-    """
-    _check_token(x_internal_token)
-    return MatchCategoryOut(
-        ok=False,
-        ozon=None,
-        wb=None,
-        error=(
-            "match_category endpoint deprecated — категории матчатся внутри "
-            "make_batch_zip автоматически. Не вызывай отдельно."
-        ),
-    )
-
-
-# ─── /internal/fill_card ───────────────────────────────────────────
-
-
-class FillCardIn(BaseModel):
-    sku: str
-    brand: str
-    name: str
-    images: dict[str, str]  # tag → public_url
-    cabinet: str | None = None  # имя кабинета или None = default
-    dry_run: bool = True
-
-
-class FillCardOut(BaseModel):
-    ok: bool
-    dry_run: bool
-    payload: dict | None = None
-    error: str | None = None
-
-
-@router.post("/fill_card", response_model=FillCardOut)
-async def fill_card(
-    req: FillCardIn,
-    request: Request,
-    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
-):
-    """MVP: собирает базовый payload карточки. Полная заливка с атрибутами —
-    через старый кнопочный pipeline (где есть категории, справочники, валидация).
-    """
-    _check_token(x_internal_token)
-    payload = {
-        "sku": req.sku,
-        "brand": req.brand,
-        "name": req.name,
-        "images": req.images,
-        "cabinet": req.cabinet or settings.default_cabinet_name,
-        "note": "MVP-payload от гнома. Полная заливка — через «📦 Новая партия».",
-    }
-    if req.dry_run:
-        return FillCardOut(ok=True, dry_run=True, payload=payload)
-    return FillCardOut(
-        ok=False,
-        dry_run=False,
-        error="Полная заливка через гнома пока не реализована. "
-              "Используй DRY_RUN=true и/или старый кнопочный сценарий.",
-    )
 
 
 # ─── /internal/parse_template ──────────────────────────────────────
@@ -899,103 +718,19 @@ async def deliver_excel_endpoint(
     return DeliverExcelOut(ok=True, sent_filename=fname, size_bytes=len(content))
 
 
-# ─── /internal/run_full_batch ──────────────────────────────────────
+# ─── общие модели для партии (используются в make_batch_zip) ─────────
 
 
 class RunBatchProductIn(BaseModel):
     sku: str
     name: str
     brand: str | None = None
-    src_url: str  # фото уже в S3 (bridge или гном залил)
+    src_url: str
     weight_g: int | None = None
-    dims: dict[str, float] | None = None  # {"l":..,"w":..,"h":..}
+    dims: dict[str, float] | None = None
 
 
-class RunBatchIn(BaseModel):
-    chat_id: int
-    products: list[RunBatchProductIn]
-    cabinet_names: list[str] | None = None  # None = default; ["all"] не поддерживаем
-    dry_run: bool | None = None  # None = берём из settings
-
-
-class RunBatchOut(BaseModel):
-    ok: bool
-    batch_id: str
-    queued: bool
-    products_count: int
-    cabinets: list[str]
-    dry_run: bool
-    note: str = ""
-
-
-@router.post("/run_full_batch", response_model=RunBatchOut)
-async def run_full_batch_endpoint(
-    req: RunBatchIn,
-    request: Request,
-    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
-):
-    """Запускает полный pipeline партии в фоне. Возвращается сразу с batch_id.
-
-    Прогресс уходит юзеру в чат через `deps.tg.send` из `pipeline.run_batch`
-    (типовые сообщения: «📥 фото в S3», «🎨 identity», тайминги этапов,
-    финальный отчёт). Гному ничего ждать не надо.
-    """
-    _check_token(x_internal_token)
-    if not req.products:
-        raise HTTPException(status_code=400, detail="products пустой")
-    if len(req.products) > 10:
-        raise HTTPException(status_code=400,
-                            detail="максимум 10 товаров на партию (см. ТЗ §1)")
-
-    deps: Deps = request.app.state.deps
-    from .models import ProductIn, RunRequest
-    from .pipeline import run_batch
-    import asyncio
-
-    products = [
-        ProductIn(
-            idx=i,
-            sku=p.sku,
-            name=p.name,
-            brand=p.brand,
-            tg_file_id="",      # фото уже в S3, не качаем из TG
-            src_url=p.src_url,
-            weight_g=p.weight_g,
-            dims=p.dims,
-        )
-        for i, p in enumerate(req.products)
-    ]
-    batch_id = f"gnome-{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    # Если LLM не передал cabinet_names — оставляем None, pipeline сам
-    # разрешит default через settings.default_cabinet_name внутри run_batch.
-    cabinet_names = req.cabinet_names or None
-    rr = RunRequest(
-        batch_id=batch_id,
-        chat_id=req.chat_id,
-        products=products,
-        cabinet_names=cabinet_names,
-    )
-
-    # DRY_RUN override на уровне текущего process'а: если запросили — временно
-    # включаем, восстанавливаем после старта таски (пока остаются в памяти,
-    # это потокоопасно если несколько батчей одновременно — пусть пока будет
-    # глобальный settings.DRY_RUN, override игнорим).
-    asyncio.create_task(run_batch(rr, deps))
-
-    cabs_used = cabinet_names or ["default"]
-    return RunBatchOut(
-        ok=True,
-        batch_id=batch_id,
-        queued=True,
-        products_count=len(products),
-        cabinets=cabs_used,
-        dry_run=settings.DRY_RUN,
-        note=("Партия запущена в фоне. Прогресс приходит в чат отдельными "
-              "сообщениями от пайплайна."),
-    )
-
-
-# ─── /internal/make_batch_zip — главный «гениальный» endpoint ─────────
+# ─── /internal/make_batch_zip — главный endpoint ──────────────────────
 # Партия → фото → категории → проверка кеша шаблонов → заполнение →
 # ZIP с photos/+ozon/+wb/+README.txt → отправка юзеру в TG. БЕЗ API
 # заливки на маркетплейсы — юзер сам грузит файл в свой кабинет.

@@ -4,8 +4,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="тестировали удалённый pipeline.run_batch / DRY_RUN — ZIP-фабрика заменила")
+
 from app.models import CategoryRef, ProductState
-from app.pipeline import CategoryData, Deps, upload_ozon, upload_wb
+# from app.pipeline import CategoryData, Deps, upload_ozon, upload_wb  # удалено вместе с pipeline.run_batch
 
 
 def _state(sku: str = "TEST_001") -> ProductState:
@@ -50,7 +52,7 @@ async def test_upload_ozon_dry_run_skips_api_and_sends_to_tg(monkeypatch, cat_da
     from app import config as cfg
     cfg.settings.OZON_CLIENT_ID = "x"
     cfg.settings.OZON_API_KEY = "y"
-    cfg.settings.DRY_RUN = True
+#     cfg.settings.DRY_RUN = True  # DRY_RUN удалён из settings
 
     tg = MagicMock()
     tg.send = AsyncMock()
@@ -87,7 +89,7 @@ async def test_upload_ozon_dry_run_skips_api_and_sends_to_tg(monkeypatch, cat_da
 async def test_upload_wb_dry_run_skips_api_and_sends_to_tg(monkeypatch, cat_data):
     from app import config as cfg
     cfg.settings.WB_TOKEN = "tok"
-    cfg.settings.DRY_RUN = True
+#     cfg.settings.DRY_RUN = True  # DRY_RUN удалён из settings
 
     tg = MagicMock()
     tg.send = AsyncMock()

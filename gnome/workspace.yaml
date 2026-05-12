@@ -21,18 +21,14 @@ ai_provider:
   base_url: https://api.aitunnel.ru/v1
   api_key_env: AITUNNEL_API_KEY
 
-# Whitelisted скиллы — чтобы случайно не подцепить чужой код в skills/
+# Whitelisted скиллы
 allowed_skills:
-  - make_batch_zip          # главный
-  - generate_image
-  - match_category
-  - fill_card
-  - parse_template
-  - fill_excel_batch
-  - load_wb_dropdowns
-  - deliver_excel
-  - ask_user_choice
-  - run_full_batch          # deprecated (API-заливка)
+  - make_batch_zip          # главный — собирает ZIP и шлёт юзеру
+  - parse_template          # вызывается bridge'м когда юзер кидает xlsx
+  - fill_excel_batch        # внутренний, дёргается из make_batch_zip
+  - load_wb_dropdowns       # внутренний, для WB-шаблонов
+  - deliver_excel           # ручная отправка xlsx (опционально)
+  - ask_user_choice         # confidence-based вопрос юзеру
 
 # Backend cz-backend.service на :8000 — тот же сервер.
 # Гном дёргает internal API оттуда (aitunnel-клиент, S3, WB, Ozon

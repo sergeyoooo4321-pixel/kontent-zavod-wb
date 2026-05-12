@@ -119,11 +119,6 @@ class Settings(BaseSettings):
     # Опционально по §3.4 ТЗ. По умолчанию False (старое поведение — без паузы).
     APPROVAL_AFTER_PHASE1: bool = False
 
-    # DRY_RUN: при True upload_ozon / upload_wb НЕ делают реальные POST в API
-    # маркетплейсов — собирают payload, шлют его в TG как JSON-документ.
-    # Можно переключать прямо из бота в runtime через кнопку «Настройки».
-    DRY_RUN: bool = False
-
     # Runtime
     MAX_PARALLEL_PRODUCTS: int = 10
     HTTP_TIMEOUT_SEC: int = 60

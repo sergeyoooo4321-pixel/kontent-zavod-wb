@@ -5,12 +5,9 @@
 
 Состояния (TgSession.phase):
   idle              — главное меню
-  cabinet_select    — выбор кабинета (Профит / Прогресс 24 / 247 / ТНП / mirror)
-  settings          — настройки (DRY_RUN toggle, текущий кабинет)
-  photos            — приём фото
-  names             — приём названий+артикулов
-  confirm           — подтверждение запуска
-  running           — пайплайн идёт
+  cabinet_select    — выбор кабинета (Профит / Прогресс 24 / 247 / ТНП)
+  settings          — настройки (выбор кабинета, очистить разговор)
+  gnome_chat        — чат с гномом (главный сценарий, ZIP-фабрика)
 """
 from __future__ import annotations
 
@@ -22,7 +19,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import settings
-from .models import ProductIn, RunRequest
 
 logger = logging.getLogger(__name__)
 
@@ -52,32 +48,17 @@ def _get_session(chat_id: int) -> TgSession:
     return s
 
 
-def _reset_partial(chat_id: int) -> TgSession:
-    """Сбрасывает партию (фото/названия), сохраняя cabinet."""
-    cab = _sessions.get(chat_id).cabinet if _sessions.get(chat_id) else None
-    s = TgSession(cabinet=cab)
-    _sessions[chat_id] = s
-    return s
-
-
 # ─── метки для UI ────────────────────────────────────────────────
 
 
-# Канон названий кнопок — собраны в одном месте чтобы не разъезжалось
-BTN_NEW_BATCH = "📦 Новая партия"           # legacy (старый кнопочный flow)
+# Канон названий кнопок
+BTN_NEW_BATCH = "📦 Новая партия"  # legacy — на нажатие переводим в gnome_chat
 BTN_GNOME = "🧙 Чат с гномом"
 BTN_CABINET_PREFIX = "🏪 Кабинет:"  # динамический суффикс
 BTN_SETTINGS = "⚙️ Настройки"
 BTN_HELP = "ℹ️ Помощь"
 BTN_BACK = "◀️ Назад в меню"
 BTN_GNOME_RESET = "🧙 Очистить разговор"
-# Legacy-кнопки (старый кнопочный flow до перехода на ZIP-фабрику).
-# Сами кнопки больше не отображаются, обработчики оставлены для совместимости.
-BTN_PHOTOS_DONE = "✅ Готово, к названиям"
-BTN_RESET = "🔄 Сбросить партию"
-BTN_RUN = "▶️ Запустить генерацию"
-BTN_CONFIRM_BACK = "◀️ Назад к названиям"
-BTN_CABINET_ALL = "🔄 Все сразу (mirror)"
 
 CABINET_DETAILS = {
     "profit": "Профит",
@@ -159,45 +140,7 @@ def _kb_settings(s: TgSession) -> dict:
     ])
 
 
-def _kb_photos() -> dict:
-    return _kb([
-        [BTN_PHOTOS_DONE],
-        [BTN_RESET],
-        [BTN_BACK],
-    ])
-
-
-def _kb_names() -> dict:
-    return _kb([
-        [BTN_RESET],
-        [BTN_BACK],
-    ])
-
-
-def _kb_confirm() -> dict:
-    return _kb([
-        [BTN_RUN],
-        [BTN_CONFIRM_BACK],
-        [BTN_RESET],
-    ])
-
-
-def _kb_running() -> dict:
-    return _kb([
-        [BTN_BACK],
-    ])
-
-
 # ─── helpers ──────────────────────────────────────────────────────
-
-
-def _settings_dry_btn_match(text: str) -> bool:
-    """Любой вариант DRY_RUN-кнопки (вкл/выкл) — это toggle."""
-    return text.startswith("⚙️ DRY_RUN:")
-
-
-def _dry_text() -> str:
-    return "✅ вкл" if settings.DRY_RUN else "❌ выкл"
 
 
 async def _send(deps, chat_id: int, text: str, kb: dict | None = None,
@@ -493,9 +436,12 @@ async def _handle_message(msg: dict, deps) -> None:
     if text in ("/help", BTN_HELP):
         await _send(deps, chat_id, _help_text(), kb=_kb_main(s))
         return
-    if text in ("/reset", BTN_RESET):
-        s = _reset_partial(chat_id)
-        await _send(deps, chat_id, "🧹 Партия сброшена. Кабинет сохранён.", kb=_kb_main(s))
+    if text == "/reset":
+        # /reset теперь сбрасывает сессию гнома, а не partial-партию
+        await _gnome_reset(deps, chat_id)
+        s.phase = "idle"
+        await _send(deps, chat_id,
+            "🧹 История разговора с гномом очищена.", kb=_kb_main(s))
         return
 
     # ── кнопка «Назад в меню» работает на любой фазе ─────
@@ -576,103 +522,14 @@ async def _handle_message(msg: dict, deps) -> None:
         await _show_settings(deps, chat_id, s)
         return
 
-    if s.phase == "photos":
-        if has_image:
-            s.photos.append({"file_id": image_file_id, "idx": len(s.photos)})
-            await _send(deps, chat_id,
-                f"📷 Фото *{len(s.photos)}* принято. "
-                "Пришли следующее или жми «✅ Готово».",
-                kb=_kb_photos())
-            return
-        if text == BTN_PHOTOS_DONE:
-            if not s.photos:
-                await _send(deps, chat_id, "Сначала пришли хотя бы одно фото.", kb=_kb_photos())
-                return
-            if len(s.photos) > 10:
-                await _send(deps, chat_id,
-                    f"Максимум 10 товаров. У тебя {len(s.photos)}. Жми «🔄 Сбросить партию».",
-                    kb=_kb_photos())
-                return
-            s.phase = "names"
-            await _send(deps, chat_id,
-                f"✅ Принято *{len(s.photos)}* фото.\n\n"
-                f"Теперь артикул и название для *фото №1*.\nФормат: `Артикул, Название`",
-                kb=_kb_names())
-            return
-        if text:
-            await _send(deps, chat_id,
-                "Сейчас фаза приёма фото. Пришли фотографию (как фото или как файл-картинку) "
-                "или жми «✅ Готово».",
-                kb=_kb_photos())
-        return
-
-    if s.phase == "names":
-        if has_image:
-            await _send(deps, chat_id,
-                "Сейчас фаза приёма названий. Фото добавлять нельзя.",
-                kb=_kb_names())
-            return
-        if not text:
-            await _send(deps, chat_id, "Жду артикул и название через запятую.", kb=_kb_names())
-            return
-        parts = [x.strip() for x in text.replace(";", ",").replace("\t", ",").split(",") if x.strip()]
-        if len(parts) < 2:
-            await _send(deps, chat_id,
-                "Неверный формат. Должно быть: `Артикул, Название`.\n"
-                "Пример: `COF-001, Кофе Арабика 250г`",
-                kb=_kb_names())
-            return
-        sku = parts[0]
-        name = ", ".join(parts[1:])
-        s.products.append({"name": name, "sku": sku})
-        next_idx = len(s.products)
-        if next_idx < len(s.photos):
-            await _send(deps, chat_id,
-                f"✔️ Фото {next_idx}: `{sku}` — {name}\n\n"
-                f"Теперь артикул+название для *фото №{next_idx + 1}*:",
-                kb=_kb_names())
-            return
-        # все названия введены → confirm
-        s.phase = "confirm"
-        cab = _cabinet_label(s.cabinet)
-        lines = [
-            "📝 *Партия готова к запуску*", "",
-            f"🏪 Кабинет: *{cab}*",
-            f"⚙️ DRY\\_RUN: *{_dry_text()}*", "",
-        ]
-        for i, p in enumerate(s.products, 1):
-            lines.append(f"{i}) `{p['sku']}` — {p['name']}")
-        lines.append("")
-        lines.append(f"Всего *{len(s.products)} товаров* × 4 фото = "
-                     f"*{len(s.products) * 4}* изображений")
-        lines.append("")
-        lines.append("Жми «▶️ Запустить генерацию».")
-        await _send(deps, chat_id, "\n".join(lines), kb=_kb_confirm())
-        return
-
-    if s.phase == "confirm":
-        if text == BTN_RUN:
-            await _start_pipeline(chat_id, deps, s)
-            return
-        if text == BTN_CONFIRM_BACK:
-            # вернёмся к редактированию названий — упрощаем: просим заново
-            s.phase = "names"
-            s.products = []
-            await _send(deps, chat_id,
-                "Возвращаемся к названиям. Введи снова `Артикул, Название` "
-                f"для *фото №1* (всего {len(s.photos)}):",
-                kb=_kb_names())
-            return
+    # Legacy фазы photos/names/confirm/running (старый кнопочный flow)
+    # удалены — если кто-то застрял в них, переводим в gnome_chat.
+    if s.phase in ("photos", "names", "confirm", "running"):
+        s.phase = "gnome_chat"
         await _send(deps, chat_id,
-            "Жми «▶️ Запустить генерацию», «◀️ Назад к названиям» или «🔄 Сбросить партию».",
-            kb=_kb_confirm())
-        return
-
-    if s.phase == "running":
-        await _send(deps, chat_id,
-            "⏳ Партия уже идёт. Жди отчёт. /reset отменит сессию "
-            "(но не остановит уже запущенный пайплайн).",
-            kb=_kb_running())
+            "Старый кнопочный сценарий удалён. Теперь всё через гнома — "
+            "кидай фото и пиши `артикул, название`, в конце скажи «поехали».",
+            kb=_kb_gnome())
         return
 
     if s.phase == "gnome_chat":
@@ -771,47 +628,3 @@ async def _handle_message(msg: dict, deps) -> None:
         return
 
 
-# ─── запуск pipeline ──────────────────────────────────────────────
-
-
-async def _start_pipeline(chat_id: int, deps, s: TgSession) -> None:
-    s.phase = "running"
-    batch_id = f"{int(time.time())}-{uuid.uuid4().hex[:6]}"
-    products = [
-        ProductIn(idx=i, sku=p["sku"], name=p["name"], tg_file_id=s.photos[i]["file_id"])
-        for i, p in enumerate(s.products)
-    ]
-    if s.cabinet == "all":
-        cabinet_names = [c.name for c in settings.list_cabinets()]
-    elif s.cabinet:
-        cabinet_names = [s.cabinet]
-    else:
-        cabinet_names = None  # pipeline сам подберёт default-кабинет
-    req = RunRequest(batch_id=batch_id, chat_id=chat_id, products=products,
-                     cabinet_names=cabinet_names)
-    cab_label = _cabinet_label(s.cabinet)
-    dry = _dry_text()
-
-    await _send(deps, chat_id,
-        f"🚀 *Партия* `{batch_id}` запущена\n\n"
-        f"🏪 Кабинет: *{cab_label}*\n"
-        f"⚙️ DRY\\_RUN: *{dry}*\n\n"
-        "_Прогресс пришлю отдельными сообщениями._",
-        kb=_kb_running())
-
-    asyncio.create_task(_run_and_cleanup(req, deps, chat_id))
-
-
-async def _run_and_cleanup(req: RunRequest, deps, chat_id: int) -> None:
-    from .pipeline import run_batch
-    try:
-        await run_batch(req, deps)
-    finally:
-        s = _sessions.get(chat_id)
-        if s and s.phase == "running":
-            cab = s.cabinet
-            new_s = TgSession(cabinet=cab)
-            _sessions[chat_id] = new_s
-            await _send(deps, chat_id,
-                "🏁 *Партия завершена.* Можно запускать следующую.",
-                kb=_kb_main(new_s))

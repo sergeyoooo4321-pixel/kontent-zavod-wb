@@ -3,8 +3,10 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.skip(reason="тестировали удалённый pipeline.run_batch / DRY_RUN — ZIP-фабрика заменила")
+
 from app.models import RunRequest, ProductIn
-from app.pipeline import Deps, run_batch
+# from app.pipeline import Deps  # run_batch удалён  # удалено вместе с pipeline.run_batch
 from app.s3 import S3Client
 
 
