@@ -80,8 +80,8 @@ async def lifespan(app: FastAPI):
 
     app.state.deps = Deps(tg=tg, kie=kie, s3=s3, ozon=ozon, wb=wb, http=http)
     app.state.http = http
-    logger.info("cz-backend started: kie=%s s3=%s ozon=%s wb=%s",
-                settings.KIE_BASE, settings.S3_BUCKET,
+    logger.info("cz-backend started: ai=%s s3=%s ozon=%s wb=%s",
+                settings.AITUNNEL_BASE, settings.S3_BUCKET,
                 "yes" if settings.has_ozon_creds else "no",
                 "yes" if settings.has_wb_creds else "no")
     try:
