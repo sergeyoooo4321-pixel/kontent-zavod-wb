@@ -52,15 +52,31 @@ class OzonClient:
         reraise=True,
     )
     async def _post(self, path: str, body: dict | None = None) -> dict:
-        r = await self._http.post(
-            f"{self._base}{path}",
-            headers=self._headers,
-            json=body or {},
-            timeout=60.0,
-        )
-        if r.status_code >= 400:
-            raise OzonError(f"POST {path}: {r.status_code} {r.text[:300]}")
-        return r.json()
+        # Ozon rate-limit: 429 при перегрузке. Тенасити-обёртка снаружи
+        # покрывает только httpx.HTTPError, а 429 приходит как валидный
+        # response — нужен явный внутренний retry.
+        for attempt in range(5):
+            r = await self._http.post(
+                f"{self._base}{path}",
+                headers=self._headers,
+                json=body or {},
+                timeout=60.0,
+            )
+            if r.status_code == 429:
+                ra = 5.0
+                try:
+                    ra = float(r.headers.get("Retry-After") or 5)
+                except ValueError:
+                    pass
+                wait = min(max(ra, 5.0 * (2 ** attempt)), 60.0)
+                logger.warning("Ozon 429 POST %s, wait=%.1fs attempt=%d/5",
+                               path, wait, attempt + 1)
+                await asyncio.sleep(wait)
+                continue
+            if r.status_code >= 400:
+                raise OzonError(f"POST {path}: {r.status_code} {r.text[:300]}")
+            return r.json()
+        raise OzonError(f"POST {path}: 429 после 5 попыток")
 
     # ─── категории ───────────────────────────────────────────
 

@@ -1,4 +1,7 @@
-"""Тесты retry-обёрток kie.ai (create_image_task_with_retry)."""
+"""Тесты retry-обёрток kie.ai (create_image_task_with_retry).
+
+DEPRECATED: после миграции на aitunnel.ru job-style API удалён. Тесты skip.
+"""
 from __future__ import annotations
 
 import json
@@ -7,6 +10,8 @@ import httpx
 import pytest
 
 from app.kie_ai import KieAIClient, KieAIError
+
+pytestmark = pytest.mark.skip(reason="kie.ai async API заменён на aitunnel — тесты не релевантны")
 
 
 @pytest.mark.asyncio

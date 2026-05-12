@@ -27,8 +27,9 @@ def build_final_report_md(report: Report) -> str:
     lines.append("")
 
     if report.successes:
-        ozon_ok = [i for i in report.successes if i.mp == "ozon"]
-        wb_ok = [i for i in report.successes if i.mp == "wb"]
+        # mp у нас вида "ozon[Профит]" / "wb[Прогресс 24]" — учитываем префикс.
+        ozon_ok = [i for i in report.successes if (i.mp or "").startswith("ozon")]
+        wb_ok = [i for i in report.successes if (i.mp or "").startswith("wb")]
         lines.append(f"✅ Ozon: {len(ozon_ok)}, WB: {len(wb_ok)}")
 
     if report.errors:

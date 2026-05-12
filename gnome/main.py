@@ -79,8 +79,11 @@ async def healthz():
 
 @app.post("/chat", response_model=ChatOut)
 async def chat(req: ChatIn):
-    if not settings.KIE_API_KEY:
-        raise HTTPException(status_code=503, detail="KIE_API_KEY не задан в .env")
+    if not (settings.AITUNNEL_API_KEY or settings.KIE_API_KEY):
+        raise HTTPException(
+            status_code=503,
+            detail="AITUNNEL_API_KEY (или KIE_API_KEY как fallback) не задан в .env",
+        )
     engine: QueryEngine = app.state.engine
     reply = await engine.query(req.chat_id, req.text, images=req.images)
     from .agent import APPROVAL_MARKER

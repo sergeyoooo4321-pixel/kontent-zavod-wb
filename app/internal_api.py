@@ -138,12 +138,23 @@ async def gen_image(
 
     async def _gen_one(tag: str) -> tuple[str, str | None, str | None]:
         try:
-            prompt = compile_image_prompt(brief, req.name, mode=tag if tag in ("main", "extra") else "pack")
+            # compile_image_prompt поддерживает только main / pack2 / pack3 / extra
+            qty_for_pack = 2 if tag == "pack2" else (3 if tag == "pack3" else None)
+            if tag in ("main", "extra", "pack2", "pack3"):
+                prompt_kwargs = {"mode": tag}
+                if qty_for_pack:
+                    prompt_kwargs["qty"] = qty_for_pack
+                prompt = compile_image_prompt(brief, req.name, **prompt_kwargs)
+            else:
+                # незнакомый tag — отдадим main-промпт чтобы не упасть
+                prompt = compile_image_prompt(brief, req.name, mode="main")
             kie_url = await deps.kie.generate_image_with_retry(
                 prompt=prompt,
                 input_urls=[req.src_url],
             )
-            content = await deps.s3.fetch(kie_url)
+            # aitunnel часто возвращает data:URI / base64 вместо URL —
+            # fetch_or_decode_image универсально обработает все варианты.
+            content = await deps.kie.fetch_or_decode_image(kie_url)
             public = await deps.s3.put_public(
                 S3Client.build_key(batch_id, sku, tag), content,
             )
@@ -189,25 +200,19 @@ async def match_category(
     request: Request,
     x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
 ):
-    """Простейший категори-матчинг: возвращает топ кандидатов по справочникам.
-
-    На этом MVP-этапе — просто LLM на name+brand, без полного pipeline.
-    Если нужен глубокий поиск с справочниками — гном может попросить юзера
-    запустить старый кнопочный сценарий «📦 Новая партия».
+    """Stub: полный match_category — внутри make_batch_zip; этот endpoint
+    deprecated.
     """
     _check_token(x_internal_token)
-    deps: Deps = request.app.state.deps
-    out: dict[str, Any] = {"ok": True}
-    try:
-        from .pipeline import _llm_pick_category_top  # type: ignore  # may not exist
-    except ImportError:
-        _llm_pick_category_top = None  # type: ignore
-
-    # Фолбэк: если хелпера нет, возвращаем пустые кандидаты с пометкой.
-    out["ozon"] = None
-    out["wb"] = None
-    out["error"] = "match_category на этом MVP-этапе не реализовал полный пайплайн — используй кнопку «📦 Новая партия» в боте"
-    return MatchCategoryOut(**out)
+    return MatchCategoryOut(
+        ok=False,
+        ozon=None,
+        wb=None,
+        error=(
+            "match_category endpoint deprecated — категории матчатся внутри "
+            "make_batch_zip автоматически. Не вызывай отдельно."
+        ),
+    )
 
 
 # ─── /internal/fill_card ───────────────────────────────────────────
@@ -326,6 +331,24 @@ async def parse_template_endpoint(
 
     n_required = sum(1 for f in spec.fields if f.required)
     n_with_dd = sum(1 for f in spec.fields if f.dropdown)
+
+    # Кладём оригинал xlsx и meta.json в template_cache, чтобы потом
+    # find_template(cabinet, mp, category_id) находил их при сборке партии.
+    # Cache переживает рестарт сервиса.
+    try:
+        from .template_cache import save_template
+        if spec.category_id:
+            save_template(
+                cabinet=cabinet,
+                source_xlsx=p,
+                parsed_meta_json=out_path,
+                marketplace=spec.marketplace,
+                category_id=spec.category_id,
+            )
+    except Exception as e:
+        logger.warning("template_cache: save failed for %s: %s",
+                       req.xlsx_path, str(e)[:200])
+
     return ParseTemplateOut(
         ok=True,
         saved_to=str(out_path),
@@ -452,19 +475,23 @@ def _det_value_for_sku(
     if field_key == "category_path":
         return category_path
     if field_key == "weight_unit_g":
-        return str(sku_row.get("weight_unit_g") or 0) or None
+        v = sku_row.get("weight_unit_g")
+        return str(v) if v else None
     if field_key == "weight_packed_g":
-        v = sku_row.get("weight_packed_g") or 0
         if marketplace == "wb":
-            # WB ожидает кг с 2 знаками
-            return str(sku_row.get("weight_wb_kg") or 0)
+            v = sku_row.get("weight_wb_kg")
+            return str(v) if v else None
+        v = sku_row.get("weight_packed_g")
         return str(v) if v else None
     if field_key == "dim_l":
-        return str(dims.get("l", 0)) or None
+        v = dims.get("l")
+        return str(v) if v else None
     if field_key == "dim_w":
-        return str(dims.get("w", 0)) or None
+        v = dims.get("w")
+        return str(v) if v else None
     if field_key == "dim_h":
-        return str(dims.get("h", 0)) or None
+        v = dims.get("h")
+        return str(v) if v else None
     if field_key == "vat":
         return str(nds_value())  # 22
     if field_key == "price":
@@ -965,4 +992,330 @@ async def run_full_batch_endpoint(
         dry_run=settings.DRY_RUN,
         note=("Партия запущена в фоне. Прогресс приходит в чат отдельными "
               "сообщениями от пайплайна."),
+    )
+
+
+# ─── /internal/make_batch_zip — главный «гениальный» endpoint ─────────
+# Партия → фото → категории → проверка кеша шаблонов → заполнение →
+# ZIP с photos/+ozon/+wb/+README.txt → отправка юзеру в TG. БЕЗ API
+# заливки на маркетплейсы — юзер сам грузит файл в свой кабинет.
+
+
+class MakeBatchZipIn(BaseModel):
+    chat_id: int
+    products: list[RunBatchProductIn]   # переиспользуем модель из run_full_batch
+    cabinet: str | None = None
+
+
+class MissingTemplateInfo(BaseModel):
+    mp: str                              # ozon | wb
+    category_id: int
+    category_path: str = ""
+
+
+class MakeBatchZipOut(BaseModel):
+    ok: bool
+    batch_id: str
+    need_templates: list[MissingTemplateInfo] = []
+    zip_sent: bool = False
+    n_products: int = 0
+    n_skus: int = 0
+    n_xlsx: int = 0
+    error: str | None = None
+
+
+async def _run_zip_pipeline(req: MakeBatchZipIn, deps: Deps, batch_id: str) -> None:
+    """Фоновая таска: фото → категории → шаблоны → заполнение → ZIP → TG.
+
+    Любая ошибка ловится и отчитывается юзеру в чат, чтобы фоновая корутина
+    не падала молча.
+    """
+    from pathlib import Path
+
+    from .models import ProductIn, ProductState
+    from .pipeline import (
+        process_product_images,
+        match_category,
+        _flatten_tree,
+    )
+    from .template_cache import find_template
+    from .zip_builder import build_batch_zip
+
+    chat_id = req.chat_id
+    cabinet = req.cabinet or settings.default_cabinet_name
+
+    try:
+        await deps.tg.send(
+            chat_id,
+            f"🟦 *Партия* `{batch_id}` собирается ({len(req.products)} товаров)",
+        )
+    except Exception:
+        pass
+
+    # 1. ProductState
+    products_in = [
+        ProductIn(
+            idx=i, sku=p.sku, name=p.name, brand=p.brand,
+            tg_file_id="", src_url=p.src_url,
+            weight_g=p.weight_g, dims=p.dims,
+        )
+        for i, p in enumerate(req.products)
+    ]
+    states = [ProductState.from_in(p) for p in products_in]
+
+    # 2. Этап 1 — фото на каждый товар (4 шт в 3:4)
+    sem = asyncio.Semaphore(settings.MAX_PARALLEL_PRODUCTS)
+    try:
+        await asyncio.gather(*[
+            process_product_images(s, batch_id, chat_id, deps, sem) for s in states
+        ])
+    except Exception as e:
+        logger.exception("zip batch: фото-этап упал")
+        try:
+            await deps.tg.send(chat_id, f"❌ Этап фото упал: {str(e)[:200]}")
+        except Exception:
+            pass
+        return
+
+    # 3. Этап 2 — категории
+    try:
+        await deps.tg.send(chat_id, "📂 Подбираю категории Ozon и WB…")
+    except Exception:
+        pass
+
+    ozon_leaves: list[dict] = []
+    wb_leaves: list[dict] = []
+    try:
+        ozon_tree = await deps.ozon.category_tree()
+        ozon_leaves = _flatten_tree(ozon_tree, is_ozon=True)
+    except Exception as e:
+        logger.warning("ozon.category_tree fail: %s", e)
+    try:
+        wb_tree = await deps.wb.subjects_tree()
+        wb_leaves = _flatten_tree(wb_tree, is_ozon=False)
+    except Exception as e:
+        logger.warning("wb.subjects_tree fail: %s", e)
+
+    if ozon_leaves or wb_leaves:
+        await asyncio.gather(*[
+            match_category(s, ozon_leaves or [], wb_leaves or [], deps)
+            for s in states
+        ])
+
+    # 4. Lookup шаблонов в кеше
+    needed: dict[tuple[str, int], str] = {}   # (mp, cat_id) → category_path
+    for s in states:
+        if s.ozon_category and s.ozon_category.id:
+            cid = int(s.ozon_category.id)
+            needed.setdefault(("ozon", cid), s.ozon_category.path or "")
+        if s.wb_subject and s.wb_subject.id:
+            sid = int(s.wb_subject.id)
+            needed.setdefault(("wb", sid), s.wb_subject.path or "")
+
+    found: dict[tuple[str, int], object] = {}
+    missing: list[MissingTemplateInfo] = []
+    for (mp, cid), path in needed.items():
+        t = find_template(cabinet, mp, cid)
+        if t is not None:
+            found[(mp, cid)] = t
+        else:
+            missing.append(MissingTemplateInfo(mp=mp, category_id=cid, category_path=path))
+
+    if missing:
+        lines = ["📋 *Нужны пустые xlsx-шаблоны от тебя:*", ""]
+        for m in missing:
+            lines.append(f"• *{m.mp.upper()}*: {m.category_path or m.category_id} (id={m.category_id})")
+        lines.append("")
+        lines.append("Скачай в кабинете МП пустой шаблон для этой категории и "
+                     "кинь файлом сюда — я запомню навсегда. После этого "
+                     "напиши «собрать ещё раз» — я доделаю партию.")
+        try:
+            await deps.tg.send(chat_id, "\n".join(lines), parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
+    # 5. Заполнение шаблонов — группируем по (mp, cat_id), вызываем
+    # /internal/fill_excel_batch локально через httpx (один self-loop).
+    try:
+        await deps.tg.send(chat_id, "✏️ Заполняю шаблоны по правилам ТЗ…")
+    except Exception:
+        pass
+
+    import httpx as _hx
+
+    grouped_products: dict[tuple[str, int], list[dict]] = {}
+    for s in states:
+        # переводим state → ProductInput для fill_excel_batch
+        prod = {
+            "sku": s.sku,
+            "name": s.name,
+            "brand": s.brand or "",
+            "weight_g": None,
+            "dims": None,
+            "images": s.images or {},
+        }
+        if s.ozon_category and s.ozon_category.id:
+            grouped_products.setdefault(("ozon", int(s.ozon_category.id)), []).append(prod)
+        if s.wb_subject and s.wb_subject.id:
+            grouped_products.setdefault(("wb", int(s.wb_subject.id)), []).append(prod)
+
+    xlsx_paths: dict[str, Path] = {}
+    n_skus = 0
+
+    auth_header = {"Content-Type": "application/json"}
+    if settings.INTERNAL_TOKEN:
+        auth_header["X-Internal-Token"] = settings.INTERNAL_TOKEN
+
+    for (mp, cid), prods in grouped_products.items():
+        t = found[(mp, cid)]
+        body = {
+            "template_json_path": t.json_path,
+            "products": prods,
+            "cabinet": cabinet or "default",
+            "answers": {},
+            "output_filename": f"{batch_id}_{mp}_{cid}.xlsx",
+        }
+        try:
+            async with _hx.AsyncClient(timeout=120.0) as http:
+                r = await http.post(
+                    "http://127.0.0.1:8000/internal/fill_excel_batch",
+                    headers=auth_header, json=body,
+                )
+            if r.status_code >= 400:
+                raise RuntimeError(f"fill_excel_batch HTTP {r.status_code}: {r.text[:200]}")
+            data = r.json()
+        except Exception as e:
+            logger.exception("fill_excel_batch fail %s/%s", mp, cid)
+            try:
+                await deps.tg.send(
+                    chat_id, f"⚠️ Заполнение {mp} cat={cid} упало: {str(e)[:200]}",
+                )
+            except Exception:
+                pass
+            continue
+
+        state = data.get("state")
+        if state == "filled":
+            xlsx_path = data.get("xlsx_path")
+            if xlsx_path and Path(xlsx_path).exists():
+                arc = f"{mp}/{batch_id}_{mp}_{cid}.xlsx"
+                xlsx_paths[arc] = Path(xlsx_path)
+                n_skus += int(data.get("skus_filled") or 0)
+        elif state == "pending":
+            # Есть незаполненные required-поля. Кладём пустой шаблон + предупреждение.
+            n_pending = len(data.get("pending") or [])
+            try:
+                await deps.tg.send(
+                    chat_id,
+                    f"⚠️ {mp.upper()} cat={cid}: {n_pending} полей "
+                    "не заполнены автоматически — допиши их в Excel перед загрузкой.",
+                )
+            except Exception:
+                pass
+            # Шаблон-исходник тоже кладём в ZIP (без заполненных строк)
+            arc = f"{mp}/EMPTY_{batch_id}_{mp}_{cid}.xlsx"
+            xlsx_paths[arc] = Path(t.xlsx_path)
+        else:
+            try:
+                await deps.tg.send(
+                    chat_id, f"❌ {mp} cat={cid}: {data.get('error') or 'unknown error'}",
+                )
+            except Exception:
+                pass
+
+    if not xlsx_paths:
+        try:
+            await deps.tg.send(chat_id, "❌ Ни один шаблон не собран. Партия не уйдёт в ZIP.")
+        except Exception:
+            pass
+        return
+
+    # 6. ZIP-упаковка + отправка юзеру
+    try:
+        await deps.tg.send(chat_id, "📦 Собираю архив…")
+    except Exception:
+        pass
+
+    photo_urls = {s.sku: dict(s.images) for s in states if s.images}
+    # для скачивания фоток из S3 используем общий httpx-клиент cz-backend;
+    # если его нет — создаём временный
+    if deps.http is not None:
+        zip_http = deps.http
+        own_zip_http = False
+    else:
+        zip_http = _hx.AsyncClient(timeout=60.0)
+        own_zip_http = True
+    try:
+        try:
+            zip_bytes = await build_batch_zip(
+                batch_id=batch_id,
+                photo_urls=photo_urls,
+                xlsx_paths=xlsx_paths,
+                http=zip_http,
+                n_products=len(states),
+                n_skus=n_skus or len(states) * 3,
+            )
+        finally:
+            if own_zip_http:
+                await zip_http.aclose()
+    except Exception as e:
+        logger.exception("zip build fail")
+        try:
+            await deps.tg.send(chat_id, f"❌ Сборка ZIP упала: {str(e)[:200]}")
+        except Exception:
+            pass
+        return
+
+    try:
+        caption = (
+            f"✅ Партия `{batch_id}` готова\n\n"
+            f"📦 {len(states)} товаров • {len(xlsx_paths)} xlsx-файл(а)\n"
+            f"Распакуй и грузи: ozon/* в кабинет Ozon, wb/* в кабинет WB.\n"
+            f"Фотки уже зашиты в xlsx как URL — отдельно грузить не надо."
+        )
+        await deps.tg.send_document(
+            chat_id=chat_id,
+            content=zip_bytes,
+            filename=f"{batch_id}.zip",
+            caption=caption,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.exception("send_document fail")
+        try:
+            await deps.tg.send(chat_id, f"❌ Отправка ZIP в TG упала: {str(e)[:200]}")
+        except Exception:
+            pass
+
+
+@router.post("/make_batch_zip", response_model=MakeBatchZipOut)
+async def make_batch_zip_endpoint(
+    req: MakeBatchZipIn,
+    request: Request,
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+):
+    """Главный endpoint новой архитектуры контент-завода.
+
+    Гном вызывает этот endpoint, он стартует фоновую таску, юзер видит
+    прогресс в TG отдельными сообщениями. На выходе — ZIP-документ с
+    фотками и заполненными xlsx-шаблонами. БЕЗ API заливки на МП.
+    """
+    _check_token(x_internal_token)
+    if not req.products:
+        raise HTTPException(status_code=400, detail="products пустой")
+    if len(req.products) > 10:
+        raise HTTPException(status_code=400, detail="максимум 10 товаров на партию")
+
+    deps: Deps = request.app.state.deps
+    batch_id = f"zip-{int(time.time())}-{uuid.uuid4().hex[:6]}"
+
+    asyncio.create_task(_run_zip_pipeline(req, deps, batch_id))
+    return MakeBatchZipOut(
+        ok=True,
+        batch_id=batch_id,
+        zip_sent=False,
+        n_products=len(req.products),
+        n_skus=0,
+        n_xlsx=0,
     )

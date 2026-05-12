@@ -926,10 +926,27 @@ async def upload_ozon(
     for s in states:
         if not s.skus_3:
             continue
-        cat_key = (s.ozon_category.id, s.ozon_category.type_id, s.wb_subject.id) if s.ozon_category and s.wb_subject else None
+        # Ozon-only сценарий: если у товара нет wb_subject, всё равно нужно
+        # уметь сматчить ozon-категорию. wb_subject.id = 0 как fallback ключа.
+        if s.ozon_category:
+            wb_id = s.wb_subject.id if s.wb_subject else 0
+            cat_key = (s.ozon_category.id, s.ozon_category.type_id, wb_id)
+        else:
+            cat_key = None
         cat = cat_data.get(cat_key) if cat_key else None
         if not cat:
-            continue
+            # Если в cat_data нет точной пары (ozon, wb_id) — попробуем
+            # ozon-only ключ с wb_id=0, иначе скипаем с явной ошибкой.
+            if s.ozon_category:
+                alt_key = (s.ozon_category.id, s.ozon_category.type_id, 0)
+                cat = cat_data.get(alt_key)
+            if not cat:
+                for row in s.skus_3:
+                    rep.errors.append(ReportItem(
+                        sku=row["sku"], mp=cab_tag,
+                        reason=f"no ozon category_data for {cat_key}",
+                    ))
+                continue
         for row in s.skus_3:
             # ключ есть, значение None → required не нашёлся, SKU исключаем
             if row["sku"] in s.attributes_ozon and s.attributes_ozon[row["sku"]] is None:

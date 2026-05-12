@@ -801,9 +801,12 @@ async def _start_pipeline(chat_id: int, deps, s: TgSession) -> None:
         ProductIn(idx=i, sku=p["sku"], name=p["name"], tg_file_id=s.photos[i]["file_id"])
         for i, p in enumerate(s.products)
     ]
-    cabinet_names = (
-        [c.name for c in settings.list_cabinets()] if s.cabinet == "all" else [s.cabinet]
-    )
+    if s.cabinet == "all":
+        cabinet_names = [c.name for c in settings.list_cabinets()]
+    elif s.cabinet:
+        cabinet_names = [s.cabinet]
+    else:
+        cabinet_names = None  # pipeline сам подберёт default-кабинет
     req = RunRequest(batch_id=batch_id, chat_id=chat_id, products=products,
                      cabinet_names=cabinet_names)
     cab_label = _cabinet_label(s.cabinet)

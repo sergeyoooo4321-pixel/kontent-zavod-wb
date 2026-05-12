@@ -1,0 +1,51 @@
+name: make_batch_zip
+description: |
+  ГЛАВНЫЙ скилл партии. Собирает партию товаров в ZIP-документ который юзер
+  сам грузит в кабинеты Ozon/WB через UI (БЕЗ API заливки на маркетплейсы).
+
+  Что делает:
+  1) генерирует 4 фото на каждый товар (gpt-image-2 image-to-image, 3:4)
+  2) определяет категорию Ozon + предмет WB через LLM
+  3) ищет пустые xlsx-шаблоны в кеше; если каких-то нет — просит юзера
+     скинуть один раз (после этого они навсегда в кеше)
+  4) заполняет шаблоны по правилам ТЗ §5.2 (SKU x1/x2/x3, габариты,
+     веса, имена, мультивыбор `;`, справочники Ozon/WB)
+  5) собирает ZIP: photos/ + ozon/*.xlsx + wb/*.xlsx + README.txt
+  6) отправляет ZIP юзеру в TG как документ
+
+  Используй когда юзер сказал «поехали» / «собирай партию» / «давай делать».
+  Прогресс по этапам и финальный документ юзер получит сам от пайплайна.
+
+version: 0.1.0
+input_schema:
+  type: object
+  properties:
+    products:
+      type: array
+      description: Список товаров партии, до 10 штук
+      items:
+        type: object
+        properties:
+          sku:
+            type: string
+            description: Артикул товара (например 59031)
+          name:
+            type: string
+            description: Полное название товара
+          brand:
+            type: string
+            description: Бренд товара
+          src_url:
+            type: string
+            description: Публичный URL исходного фото в S3
+        required:
+          - sku
+          - name
+          - src_url
+    cabinet:
+      type: string
+      description: Имя кабинета продавца (если есть). Пусто — default-кабинет.
+  required:
+    - products
+permissions: []
+requires_approval: true

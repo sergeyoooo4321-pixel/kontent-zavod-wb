@@ -1,10 +1,17 @@
-"""Тесты kie.ai клиента (с моками httpx)."""
+"""Тесты kie.ai клиента (с моками httpx).
+
+DEPRECATED: тесты под старый kie.ai job-style API (createTask + recordInfo).
+После миграции на aitunnel.ru эти методы удалены, тесты skip'аются. Новые
+интеграционные тесты под aitunnel — TODO (отдельная задача).
+"""
 import json
 
 import httpx
 import pytest
 
 from app.kie_ai import KieAIClient, KieAIError, KieAITimeout
+
+pytestmark = pytest.mark.skip(reason="kie.ai async API заменён на aitunnel — тесты не релевантны")
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,7 @@ async def test_run_batch_no_creds(monkeypatch):
     kie = MagicMock()
     kie.generate_image = AsyncMock(return_value="https://kie/x.png")
     kie.generate_image_with_retry = AsyncMock(return_value="https://kie/x.png")
+    kie.fetch_or_decode_image = AsyncMock(return_value=b"fake-image-bytes")
 
     ozon = MagicMock()
     wb = MagicMock()
