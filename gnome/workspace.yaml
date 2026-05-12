@@ -6,22 +6,37 @@ name: kontent-zavod-gnome
 owner: продавец-сеточник на маркетплейсах WB/Ozon
 purpose: |
   Помощник внутри Telegram-бота «Контент-завод».
-  Под управлением гнома — генерация фото товара (kie gpt-image-2),
-  подбор категории, заполнение и заливка карточки на WB/Ozon.
-  Работает в режиме approval: каждый ключевой шаг согласует с юзером.
+  Под управлением гнома — генерация фото товара (aitunnel gpt-image-2),
+  подбор категории, сборка партии в ZIP с готовыми xlsx-шаблонами.
+  Юзер сам грузит ZIP в кабинеты МП — без API-заливки.
 
 # Дефолтная LLM. Можно переопределить через env LLM_MODEL.
-default_model: gemini-3-pro
-fallback_model: gpt-5-2
+default_model: gemini-3.1-pro-preview
+fallback_model: claude-sonnet-4.6
+image_model: gpt-image-2
+
+# Провайдер AI: aitunnel.ru (OpenAI-совместимый агрегатор).
+ai_provider:
+  name: aitunnel.ru
+  base_url: https://api.aitunnel.ru/v1
+  api_key_env: AITUNNEL_API_KEY
 
 # Whitelisted скиллы — чтобы случайно не подцепить чужой код в skills/
 allowed_skills:
+  - make_batch_zip          # главный
   - generate_image
   - match_category
   - fill_card
+  - parse_template
+  - fill_excel_batch
+  - load_wb_dropdowns
+  - deliver_excel
+  - ask_user_choice
+  - run_full_batch          # deprecated (API-заливка)
 
 # Backend cz-backend.service на :8000 — тот же сервер.
-# Гном дёргает internal API оттуда (kie-клиент, S3, WB, Ozon уже подняты в нём).
+# Гном дёргает internal API оттуда (aitunnel-клиент, S3, WB, Ozon
+# уже подняты в нём).
 backend:
   url: http://127.0.0.1:8000
   internal_token_env: INTERNAL_TOKEN  # читаем из env
