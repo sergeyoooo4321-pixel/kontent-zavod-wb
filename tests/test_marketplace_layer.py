@@ -34,6 +34,19 @@ def test_best_candidate_uses_product_words():
     assert best.id == 2
 
 
+def test_best_candidate_prefers_substantive_product_word_over_generic_child_word():
+    candidates = _flatten_wb_subjects(
+        [
+            {"subjectID": 1, "parentName": "Детское питание", "subjectName": "Молоко детское"},
+            {"subjectID": 2, "parentName": "Красота и уход", "subjectName": "Мыло"},
+        ]
+    )
+    product = ProductInput(photo_index=1, sku="SOAP1", name="Детское твердое мыло 90 г", brand="Synergetic")
+    best = _best_candidate(product, candidates)
+    assert best is not None
+    assert best.id == 2
+
+
 def test_parse_template_hint():
     assert parse_template_hint("template ozon 17034998 12345") == ("ozon", 17034998, 12345)
     assert parse_template_hint("template wb 98765") == ("wb", 98765, None)

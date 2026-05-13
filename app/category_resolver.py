@@ -38,6 +38,17 @@ STOP_WORDS = {
     "for",
 }
 
+DOMAIN_STOP_WORDS = {
+    "детск",
+    "детское",
+    "детский",
+    "детская",
+    "женск",
+    "мужск",
+    "новый",
+    "универсальный",
+}
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -239,12 +250,27 @@ def _flatten_wb_subjects(subjects: list[dict[str, Any]]) -> list[Candidate]:
 
 def _best_candidate(product: ProductInput, candidates: list[Candidate]) -> Candidate | None:
     query = " ".join([product.name, product.brand, product.extra]).strip()
+    anchored = _anchor_candidates(query, candidates)
+    if anchored:
+        candidates = anchored
     if not candidates:
         return None
     score, candidate = max(((_score_candidate(query, c), c) for c in candidates), key=lambda item: item[0])
     if score <= 0:
         return None
     return Candidate(candidate.marketplace, candidate.id, candidate.type_id, candidate.path, round(score, 4))
+
+
+def _anchor_candidates(query: str, candidates: list[Candidate]) -> list[Candidate]:
+    roots = {
+        token[:5]
+        for token in _tokens(query)
+        if len(token) >= 4 and token[:5] not in DOMAIN_STOP_WORDS
+    }
+    if not roots:
+        return candidates
+    anchored = [candidate for candidate in candidates if any(root in candidate.path.lower() for root in roots)]
+    return anchored or candidates
 
 
 def _score_candidate(query: str, candidate: Candidate) -> float:
