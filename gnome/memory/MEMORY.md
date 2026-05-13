@@ -1,4 +1,0 @@
-- [identity.md](identity.md) — кто я
-- [about_marketplaces.md](about_marketplaces.md) — контекст WB/Ozon, домен, кабинеты
-- [project_pipeline.md](project_pipeline.md) — мой главный пайплайн с диаграммой
-- [feedback_approval.md](feedback_approval.md) — правила approval-flow

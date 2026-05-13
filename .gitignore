@@ -1,39 +1,30 @@
-# python
+.env
+.env.*
+!.env.example
+*.local
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
 __pycache__/
 *.py[cod]
-*$py.class
-.venv/
-venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-*.egg-info/
-build/
-dist/
-
-# env / secrets
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-
-# logs / runtime
-*.log
-logs/
-tmp/
-
-# OS / IDE
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-
-# project temp
-snapshot_server/
-modules/_build_*.py
-modules/*.bak
-db.sqlite
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
+.venv/
+.venv-*/
+venv/
+media/
+uploads/
+cache/
+templates_downloaded/
+u2net/
+cases/
+*.tar
+*.tar.gz
+*.zip
+*_PRIVATE_*
+*PRIVATE_SNAPSHOT*
+content-zavod-private-snapshot-*/
