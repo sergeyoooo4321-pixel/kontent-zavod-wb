@@ -7,6 +7,7 @@ from app.db import StateStore
 from app.models import BotState, PhotoIn
 from app.parsing import parse_product_text
 from app.pipeline import BatchProcessor, new_batch_id
+from app.template_cache import parse_template_hint, save_template_bytes
 from app.telegram import TelegramClient, keyboard
 
 
@@ -27,6 +28,7 @@ class Bot:
         chat = message.get("chat") or {}
         chat_id = int(chat.get("id"))
         text = (message.get("text") or "").strip()
+        caption = (message.get("caption") or "").strip()
 
         if text in {"/start", "🚀 Новая партия"}:
             await self._start(chat_id)
@@ -34,6 +36,11 @@ class Bot:
         if text in {"/reset", "🔄 Сбросить"}:
             self.store.delete(chat_id)
             await self.telegram.send_message(chat_id, "Сессия сброшена. Нажми /start, чтобы начать заново.")
+            return
+
+        template_file = self._extract_template_document(message)
+        if template_file:
+            await self._handle_template(chat_id, template_file["file_id"], caption or text or template_file["file_name"])
             return
 
         state = self.store.get(chat_id)
@@ -144,3 +151,39 @@ class Bot:
                 return PhotoIn(index=1, file_id=document["file_id"], kind="document", file_name=name, mime_type=mime)
         return None
 
+    def _extract_template_document(self, message: dict[str, Any]) -> dict[str, str] | None:
+        document = message.get("document")
+        if not document:
+            return None
+        name = document.get("file_name") or ""
+        if not name.lower().endswith(".xlsx"):
+            return None
+        return {"file_id": document["file_id"], "file_name": name}
+
+    async def _handle_template(self, chat_id: int, file_id: str, hint: str) -> None:
+        marketplace, category_id, type_id = parse_template_hint(hint)
+        try:
+            content, _file_path = await self.telegram.get_file_bytes(file_id)
+            cached = save_template_bytes(
+                self.processor.settings,
+                content=content,
+                marketplace=marketplace,
+                category_id=category_id,
+                type_id=type_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            await self.telegram.send_message(
+                chat_id,
+                (
+                    "Не смог сохранить XLSX-шаблон. Пришли файл с подписью:\n"
+                    "`template ozon <description_category_id> <type_id>`\n"
+                    "`template wb <subject_id>`\n\n"
+                    f"Ошибка: {str(exc)[:180]}"
+                ),
+            )
+            return
+        suffix = f", type_id={cached.type_id}" if cached.type_id else ""
+        await self.telegram.send_message(
+            chat_id,
+            f"Шаблон сохранён: {cached.marketplace.upper()} category_id={cached.category_id}{suffix}. Следующие партии этой категории будут заполнять официальный XLSX.",
+        )

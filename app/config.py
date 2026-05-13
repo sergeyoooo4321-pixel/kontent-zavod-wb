@@ -26,6 +26,27 @@ class Settings(BaseSettings):
     IMAGE_SIZE: str = "1024x1536"
     LLM_TEMPERATURE: float = 0.2
 
+    OZON_BASE: str = "https://api-seller.ozon.ru"
+    OZON_CLIENT_ID: str = ""
+    OZON_API_KEY: str = ""
+    OZON_PROFIT_CLIENT_ID: str = ""
+    OZON_PROFIT_API_KEY: str = ""
+    OZON_PROGRESS24_CLIENT_ID: str = ""
+    OZON_PROGRESS24_API_KEY: str = ""
+    OZON_TNP_CLIENT_ID: str = ""
+    OZON_TNP_API_KEY: str = ""
+
+    WB_BASE: str = "https://content-api.wildberries.ru"
+    WB_TOKEN: str = ""
+    WB_PROFIT_TOKEN: str = ""
+    WB_PROGRESS24_TOKEN: str = ""
+    WB_PROGRESS247_TOKEN: str = ""
+    WB_TNP_TOKEN: str = ""
+
+    MARKETPLACE_LIVE_ENABLED: bool = True
+    MARKETPLACE_CACHE_TTL_SEC: int = 21600
+    TEMPLATE_CACHE_DIR: Path = Path("runtime/templates")
+
     S3_ENDPOINT: str = "https://storage.yandexcloud.net"
     S3_REGION: str = "ru-central1"
     S3_BUCKET: str = ""
@@ -52,6 +73,33 @@ class Settings(BaseSettings):
     def s3_enabled(self) -> bool:
         return bool(self.S3_BUCKET and self.S3_ACCESS_KEY and self.S3_SECRET_KEY)
 
+    @property
+    def ozon_credentials(self) -> tuple[str, str] | None:
+        pairs = [
+            (self.OZON_CLIENT_ID, self.OZON_API_KEY),
+            (self.OZON_PROFIT_CLIENT_ID, self.OZON_PROFIT_API_KEY),
+            (self.OZON_PROGRESS24_CLIENT_ID, self.OZON_PROGRESS24_API_KEY),
+            (self.OZON_TNP_CLIENT_ID, self.OZON_TNP_API_KEY),
+        ]
+        return next(((client_id, api_key) for client_id, api_key in pairs if client_id and api_key), None)
+
+    @property
+    def wb_token(self) -> str:
+        return next(
+            (
+                token
+                for token in (
+                    self.WB_TOKEN,
+                    self.WB_PROFIT_TOKEN,
+                    self.WB_PROGRESS24_TOKEN,
+                    self.WB_PROGRESS247_TOKEN,
+                    self.WB_TNP_TOKEN,
+                )
+                if token
+            ),
+            "",
+        )
+
 
 settings = Settings()
 
@@ -62,4 +110,3 @@ def mask_secret(value: str | None) -> str:
     if len(value) <= 8:
         return "***"
     return f"{value[:4]}...{value[-4:]}"
-

@@ -46,9 +46,37 @@ class GeneratedImage(BaseModel):
     bytes_data: bytes | None = Field(default=None, exclude=True)
 
 
+class CategoryMatch(BaseModel):
+    marketplace: Literal["ozon", "wb"]
+    id: int
+    type_id: int | None = None
+    path: str = ""
+    score: float = 0.0
+
+
+class MarketplaceFieldValue(BaseModel):
+    id: str
+    name: str
+    required: bool = False
+    value: str | int | float | list[str] | None = None
+    allowed_values: list[str] = Field(default_factory=list)
+    source: str = ""
+    warning: str = ""
+
+
+class MarketplaceProfile(BaseModel):
+    ozon_category: CategoryMatch | None = None
+    wb_subject: CategoryMatch | None = None
+    ozon_fields: list[MarketplaceFieldValue] = Field(default_factory=list)
+    wb_fields: list[MarketplaceFieldValue] = Field(default_factory=list)
+    missing_required: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class ProductResult(BaseModel):
     input: ProductInput
     images: list[GeneratedImage]
+    marketplace: MarketplaceProfile | None = None
     warnings: list[str] = Field(default_factory=list)
 
 
@@ -72,4 +100,3 @@ class BatchArtifacts:
     zip_bytes: bytes
     links_csv: str
     extra: dict[str, Any] = field(default_factory=dict)
-

@@ -5,6 +5,7 @@ import logging
 from fastapi import FastAPI, Header, HTTPException, Request
 
 from app.bot import Bot
+from app.category_resolver import MarketplaceResolver
 from app.config import settings
 from app.db import StateStore
 from app.image_ai import ImageGenerator
@@ -17,12 +18,14 @@ logging.basicConfig(level=getattr(logging, settings.LOG_LEVEL.upper(), logging.I
 
 settings.RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 settings.MEDIA_FALLBACK_DIR.mkdir(parents=True, exist_ok=True)
+settings.TEMPLATE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 store = StateStore(settings.SQLITE_PATH)
 telegram = TelegramClient(settings.TG_BOT_TOKEN, settings.TG_API_BASE, settings.HTTP_TIMEOUT_SEC)
 storage = Storage(settings)
 image_generator = ImageGenerator(settings)
-processor = BatchProcessor(settings, telegram, storage, image_generator)
+marketplace_resolver = MarketplaceResolver(settings)
+processor = BatchProcessor(settings, telegram, storage, image_generator, marketplace_resolver)
 bot = Bot(store, telegram, processor, settings.MAX_PHOTOS_PER_BATCH)
 
 app = FastAPI(title="Content Zavod", version="2.0.0")
@@ -40,4 +43,3 @@ async def telegram_webhook(request: Request, x_telegram_bot_api_secret_token: st
     update = await request.json()
     await bot.handle_update(update)
     return {"ok": True}
-

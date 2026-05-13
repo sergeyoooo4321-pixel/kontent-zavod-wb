@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime
 
+from app.category_resolver import MarketplaceResolver
 from app.config import Settings
 from app.excel_export import build_zip
 from app.image_ai import ImageGenerator
@@ -12,11 +13,19 @@ from app.telegram import TelegramClient
 
 
 class BatchProcessor:
-    def __init__(self, settings: Settings, telegram: TelegramClient, storage: Storage, image_generator: ImageGenerator):
+    def __init__(
+        self,
+        settings: Settings,
+        telegram: TelegramClient,
+        storage: Storage,
+        image_generator: ImageGenerator,
+        marketplace_resolver: MarketplaceResolver | None = None,
+    ):
         self.settings = settings
         self.telegram = telegram
         self.storage = storage
         self.image_generator = image_generator
+        self.marketplace_resolver = marketplace_resolver
         self._sem = asyncio.Semaphore(settings.MAX_PARALLEL_PRODUCTS)
 
     async def process(self, chat_id: int, batch_id: str, photos: list[PhotoIn], products: list[ProductInput]) -> None:
@@ -50,9 +59,11 @@ class BatchProcessor:
                     warnings.append(f"{product.sku}: {item.warning}")
             if file_path:
                 warnings.append(f"{product.sku}: source telegram path {file_path}")
-            return ProductResult(input=product, images=images, warnings=warnings)
+            marketplace = None
+            if self.marketplace_resolver is not None:
+                marketplace = await self.marketplace_resolver.resolve(product)
+            return ProductResult(input=product, images=images, marketplace=marketplace, warnings=warnings)
 
 
 def new_batch_id(chat_id: int) -> str:
     return f"{chat_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
-
