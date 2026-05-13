@@ -239,10 +239,9 @@ def _flatten_wb_subjects(subjects: list[dict[str, Any]]) -> list[Candidate]:
 
 def _best_candidate(product: ProductInput, candidates: list[Candidate]) -> Candidate | None:
     query = " ".join([product.name, product.brand, product.extra]).strip()
-    scored = sorted((_score_candidate(query, c), c) for c in candidates)
-    if not scored:
+    if not candidates:
         return None
-    score, candidate = scored[-1]
+    score, candidate = max(((_score_candidate(query, c), c) for c in candidates), key=lambda item: item[0])
     if score <= 0:
         return None
     return Candidate(candidate.marketplace, candidate.id, candidate.type_id, candidate.path, round(score, 4))
