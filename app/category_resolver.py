@@ -56,6 +56,21 @@ PRODUCT_ANCHOR_WORDS = {
     "парфюм",
 }
 
+CATEGORY_MODIFIER_WORDS = {
+    "металлическое",
+    "металлический",
+    "металл",
+    "животных",
+    "животные",
+    "хозяйственное",
+    "хозяйственный",
+    "эротик",
+    "бани",
+    "баня",
+    "жидкое",
+    "густое",
+}
+
 DOMAIN_STOP_WORDS = {
     "детск",
     "детское",
@@ -363,6 +378,10 @@ def _score_candidate(query: str, candidate: Candidate) -> float:
         tail_tokens = set(subject_tokens)
         extra_tail = tail_tokens - product_words - query_set
         score -= len(extra_tail) * 3.5
+        absent_modifiers = (set(subject_tokens) & CATEGORY_MODIFIER_WORDS) - query_set
+        score -= len(absent_modifiers) * 8.0
+        if "косметическое" in subject_tokens or "косметический" in subject_tokens:
+            score += 2.0
     return score
 
 

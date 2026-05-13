@@ -38,7 +38,7 @@ def test_best_candidate_prefers_substantive_product_word_over_generic_child_word
     candidates = _flatten_wb_subjects(
         [
             {"subjectID": 1, "parentName": "Детское питание", "subjectName": "Молоко детское"},
-            {"subjectID": 2, "parentName": "Красота и уход", "subjectName": "Мыло"},
+            {"subjectID": 2, "parentName": "Красота и уход", "subjectName": "Мыло косметическое"},
             {"subjectID": 3, "parentName": "Хозяйственные товары", "subjectName": "Мыло металлическое"},
         ]
     )
