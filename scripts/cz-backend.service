@@ -1,0 +1,15 @@
+[Unit]
+Description=Content Zavod Telegram backend
+After=network.target
+
+[Service]
+Type=simple
+User=albert
+WorkingDirectory=/home/albert/cz-backend
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/albert/cz-backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

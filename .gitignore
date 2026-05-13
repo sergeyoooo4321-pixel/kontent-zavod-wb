@@ -28,3 +28,5 @@ cases/
 *_PRIVATE_*
 *PRIVATE_SNAPSHOT*
 content-zavod-private-snapshot-*/
+runtime/
+data/
