@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 
 SECRET_PATTERNS = [
@@ -13,10 +14,14 @@ SECRET_PATTERNS = [
 def test_no_known_secret_literals_in_repo():
     root = Path(__file__).resolve().parents[1]
     checked = []
-    for path in root.rglob("*"):
-        if path.is_dir():
-            continue
-        if ".git" in path.parts or path.suffix.lower() in {".pyc", ".db", ".sqlite3", ".zip"}:
+    tracked_files = subprocess.check_output(
+        ["git", "ls-files"],
+        cwd=root,
+        encoding="utf-8",
+    ).splitlines()
+    for rel_path in tracked_files:
+        path = root / rel_path
+        if path.suffix.lower() in {".pyc", ".db", ".sqlite3", ".zip"}:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         checked.append(path)
