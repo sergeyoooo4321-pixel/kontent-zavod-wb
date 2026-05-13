@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.config import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class Storage:
@@ -28,17 +32,28 @@ class Storage:
         safe_key = key.strip("/").replace("\\", "/")
         if self._s3:
             try:
-                self._s3.put_object(
-                    Bucket=self.settings.S3_BUCKET,
-                    Key=safe_key,
-                    Body=content,
-                    ContentType=content_type,
-                    ACL="public-read",
-                )
+                try:
+                    self._s3.put_object(
+                        Bucket=self.settings.S3_BUCKET,
+                        Key=safe_key,
+                        Body=content,
+                        ContentType=content_type,
+                        ACL="public-read",
+                    )
+                except ClientError as exc:
+                    code = exc.response.get("Error", {}).get("Code", "")
+                    if code not in {"AccessDenied", "NotImplemented", "InvalidRequest"}:
+                        raise
+                    self._s3.put_object(
+                        Bucket=self.settings.S3_BUCKET,
+                        Key=safe_key,
+                        Body=content,
+                        ContentType=content_type,
+                    )
                 base = self.settings.S3_PUBLIC_BASE.rstrip("/") or f"{self.settings.S3_ENDPOINT.rstrip('/')}/{self.settings.S3_BUCKET}"
                 return f"{base}/{safe_key}", safe_key
-            except (BotoCoreError, ClientError):
-                # Fall through to local media. The bot reports generated links either way.
+            except (BotoCoreError, ClientError) as exc:
+                logger.warning("s3.put_public fallback key=%s cause=%s", safe_key, exc)
                 pass
 
         path = self.media_dir / safe_key
@@ -51,4 +66,3 @@ class Storage:
 
 def content_hash(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
-
