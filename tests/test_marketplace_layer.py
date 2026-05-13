@@ -39,6 +39,7 @@ def test_best_candidate_prefers_substantive_product_word_over_generic_child_word
         [
             {"subjectID": 1, "parentName": "Детское питание", "subjectName": "Молоко детское"},
             {"subjectID": 2, "parentName": "Красота и уход", "subjectName": "Мыло"},
+            {"subjectID": 3, "parentName": "Хозяйственные товары", "subjectName": "Мыло металлическое"},
         ]
     )
     product = ProductInput(photo_index=1, sku="SOAP1", name="Детское твердое мыло 90 г", brand="Synergetic")

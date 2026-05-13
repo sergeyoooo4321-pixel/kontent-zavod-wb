@@ -38,6 +38,24 @@ STOP_WORDS = {
     "for",
 }
 
+PRODUCT_ANCHOR_WORDS = {
+    "мыло",
+    "порошок",
+    "шампунь",
+    "крем",
+    "гель",
+    "спрей",
+    "салфетки",
+    "масло",
+    "чай",
+    "кофе",
+    "паста",
+    "щетка",
+    "аромат",
+    "духи",
+    "парфюм",
+}
+
 DOMAIN_STOP_WORDS = {
     "детск",
     "детское",
@@ -122,6 +140,9 @@ class MarketplaceResolver:
         try:
             subjects = await self._cached_json("wb-subjects.json", self._wb.subjects)
             leaves = _flatten_wb_subjects(subjects)
+            search_leaves = await self._wb_search_leaves(product)
+            if search_leaves:
+                leaves = _dedupe_candidates(search_leaves + leaves)
             best = _best_candidate(product, leaves)
             if not best:
                 profile.missing_required.append(f"{product.sku}: WB subject not found")
@@ -138,6 +159,20 @@ class MarketplaceResolver:
         except Exception as exc:  # noqa: BLE001
             logger.warning("wb resolve failed sku=%s: %s", product.sku, exc)
             profile.warnings.append(f"{product.sku}: WB resolve failed: {str(exc)[:180]}")
+
+    async def _wb_search_leaves(self, product: ProductInput) -> list[Candidate]:
+        if self._wb is None:
+            return []
+        queries = _wb_search_queries(product.name)
+        out: list[Candidate] = []
+        for query in queries:
+            try:
+                data = await self._wb._get("/content/v2/object/all", {"locale": "ru", "name": query, "limit": 100, "offset": 0})
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("wb subject search failed query=%s: %s", query, exc)
+                continue
+            out.extend(_flatten_wb_subjects(data.get("data") or []))
+        return out
 
     async def _resolve_ozon_fields(self, product: ProductInput, category: Candidate, attrs: list[dict[str, Any]]) -> list[MarketplaceFieldValue]:
         out: list[MarketplaceFieldValue] = []
@@ -262,27 +297,72 @@ def _best_candidate(product: ProductInput, candidates: list[Candidate]) -> Candi
 
 
 def _anchor_candidates(query: str, candidates: list[Candidate]) -> list[Candidate]:
-    roots = {
-        token[:5]
-        for token in _tokens(query)
-        if len(token) >= 4 and token[:5] not in DOMAIN_STOP_WORDS
-    }
+    product_words = {token for token in _tokens(query) if token in PRODUCT_ANCHOR_WORDS}
+    if product_words:
+        exact = [
+            candidate
+            for candidate in candidates
+            if any(_word_in_path(word, candidate.path) for word in product_words)
+        ]
+        if exact:
+            return exact
+    roots = {token[:5] for token in _tokens(query) if len(token) >= 4 and token[:5] not in DOMAIN_STOP_WORDS}
     if not roots:
         return candidates
     anchored = [candidate for candidate in candidates if any(root in candidate.path.lower() for root in roots)]
     return anchored or candidates
 
 
+def _word_in_path(word: str, path: str) -> bool:
+    return word in _tokens(path)
+
+
+def _wb_search_queries(product_name: str) -> list[str]:
+    tokens = _tokens(product_name)
+    queries: list[str] = []
+    for word in tokens:
+        if word in PRODUCT_ANCHOR_WORDS:
+            queries.append(word)
+    if len(tokens) >= 2:
+        queries.append(" ".join(tokens[:2]))
+    return list(dict.fromkeys(queries))[:3]
+
+
+def _dedupe_candidates(candidates: list[Candidate]) -> list[Candidate]:
+    seen: set[tuple[str, int, int | None]] = set()
+    out: list[Candidate] = []
+    for candidate in candidates:
+        key = (candidate.marketplace, candidate.id, candidate.type_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+
 def _score_candidate(query: str, candidate: Candidate) -> float:
     query_tokens = _tokens(query)
+    query_set = set(query_tokens)
     path = candidate.path.lower()
+    subject_path = candidate.path.split("/")[-1].strip().lower()
     path_tokens = _tokens(candidate.path)
+    subject_tokens = _tokens(subject_path)
     if not query_tokens or not path_tokens:
         return 0
     roots = {token[:5] for token in query_tokens if len(token) >= 4}
     score = sum(4.0 for root in roots if root in path)
     score += len(set(query_tokens) & set(path_tokens)) * 2.5
     score += SequenceMatcher(None, " ".join(query_tokens), " ".join(path_tokens)).ratio()
+    product_words = set(query_tokens) & PRODUCT_ANCHOR_WORDS
+    if product_words:
+        subject_overlap = len(product_words & set(subject_tokens))
+        if subject_overlap:
+            score += subject_overlap * 8.0
+        parent_tokens = set(path_tokens) - set(subject_tokens)
+        score -= len((parent_tokens & query_set) - product_words) * 4.0
+        tail_tokens = set(subject_tokens)
+        extra_tail = tail_tokens - product_words - query_set
+        score -= len(extra_tail) * 3.5
     return score
 
 
