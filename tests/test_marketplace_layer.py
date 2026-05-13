@@ -48,6 +48,50 @@ def test_best_candidate_prefers_substantive_product_word_over_generic_child_word
     assert best.id == 2
 
 
+def test_wb_search_candidates_are_preferred_over_full_tree(monkeypatch):
+    from app.category_resolver import MarketplaceResolver
+
+    captured = {}
+
+    def fake_best(product, candidates):
+        captured["ids"] = [candidate.id for candidate in candidates]
+        return candidates[0]
+
+    monkeypatch.setattr("app.category_resolver._best_candidate", fake_best)
+
+    resolver = object.__new__(MarketplaceResolver)
+    resolver._wb = object()
+    product = ProductInput(photo_index=1, sku="SOAP1", name="Мыло 90 г")
+    full_tree = [{"subjectID": 3, "parentName": "Хозяйственные товары", "subjectName": "Мыло металлическое"}]
+    search_tree = [{"subjectID": 2, "parentName": "Красота", "subjectName": "Мыло косметическое"}]
+
+    async def fake_search(_product):
+        return _flatten_wb_subjects(search_tree)
+
+    resolver._wb_search_leaves = fake_search
+
+    import asyncio
+
+    async def run():
+        profile = type("Profile", (), {"wb_subject": None, "wb_fields": [], "missing_required": [], "warnings": []})()
+        async def fake_subjects(_self):
+            return full_tree
+
+        async def fake_charcs(_self, _subject_id):
+            return []
+
+        resolver._wb = type("WB", (), {"subjects": fake_subjects, "subject_characteristics": fake_charcs})()
+
+        async def fake_cached(_name, loader):
+            return await loader()
+
+        resolver._cached_json = fake_cached
+        await MarketplaceResolver._resolve_wb(resolver, product, profile)
+
+    asyncio.run(run())
+    assert captured["ids"] == [2]
+
+
 def test_parse_template_hint():
     assert parse_template_hint("template ozon 17034998 12345") == ("ozon", 17034998, 12345)
     assert parse_template_hint("template wb 98765") == ("wb", 98765, None)

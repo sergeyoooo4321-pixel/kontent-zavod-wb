@@ -142,7 +142,7 @@ class MarketplaceResolver:
             leaves = _flatten_wb_subjects(subjects)
             search_leaves = await self._wb_search_leaves(product)
             if search_leaves:
-                leaves = _dedupe_candidates(search_leaves + leaves)
+                leaves = _dedupe_candidates(search_leaves)
             best = _best_candidate(product, leaves)
             if not best:
                 profile.missing_required.append(f"{product.sku}: WB subject not found")
